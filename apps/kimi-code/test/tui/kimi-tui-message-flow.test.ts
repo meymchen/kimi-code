@@ -1538,6 +1538,7 @@ describe('KimiTUI message flow', () => {
       sendQueued,
     );
 
+    vi.mocked(driver.state.ui.requestRender).mockClear();
     driver.sessionEventHandler.handleEvent(
       {
         type: 'tool.call.started',
@@ -1550,7 +1551,9 @@ describe('KimiTUI message flow', () => {
       } as Event,
       sendQueued,
     );
+    expect(driver.state.ui.requestRender).toHaveBeenCalled();
 
+    vi.mocked(driver.state.ui.requestRender).mockClear();
     driver.sessionEventHandler.handleEvent(
       {
         type: 'turn.ended',
@@ -1561,6 +1564,7 @@ describe('KimiTUI message flow', () => {
       } as Event,
       sendQueued,
     );
+    expect(driver.state.ui.requestRender).toHaveBeenCalled();
 
     const activity = stripSgr(renderActivity(driver));
     expect(activity).toContain('Agent swarm: Review changed files');

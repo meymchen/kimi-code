@@ -999,7 +999,10 @@ export class KimiTUI {
   }
 
   setAgentSwarmProgress(component: AgentSwarmProgressComponent | null): void {
-    if (this.state.agentSwarmProgress === component) return;
+    if (this.state.agentSwarmProgress === component) {
+      if (component !== null) this.state.ui.requestRender();
+      return;
+    }
     this.state.agentSwarmProgress = component;
     this.updateActivityPane();
     this.state.ui.requestRender();
