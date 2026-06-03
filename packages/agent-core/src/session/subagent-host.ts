@@ -19,9 +19,7 @@ import {
   SubagentLaunchQueue,
   formatQueuedSubagentError,
   isRateLimit429Error,
-  type PreparedQueuedSubagentTask,
   type QueuedSubagentAttemptOutcome,
-  type QueuedSubagentRunHandle,
   type QueuedSubagentRunOptions,
   type QueuedSubagentRunResult,
   type QueuedSubagentTask,
@@ -32,8 +30,6 @@ export type {
   QueuedSubagentRunOptions,
   QueuedSubagentRunResult,
   QueuedSubagentTask,
-  PreparedQueuedSubagentTask,
-  QueuedSubagentRunHandle,
 } from './subagent-launch-queue';
 
 /**
@@ -71,13 +67,6 @@ type ActiveChild = {
   readonly runInBackground: boolean;
 };
 
-type PreparedSubagent = {
-  readonly agentId: string;
-  readonly profileName: string;
-  readonly start: () => SubagentHandle;
-  readonly cancel: (reason: unknown) => void;
-};
-
 export type SubagentHandle = {
   readonly agentId: string;
   readonly profileName: string;
@@ -98,16 +87,8 @@ export class SessionSubagentHost {
   }
 
   async spawn(options: SpawnSubagentOptions): Promise<SubagentHandle> {
-    return (await this.prepareSubagent(options)).start();
-  }
-
-  private async prepareSubagent(options: SpawnSubagentOptions): Promise<PreparedSubagent> {
     options.signal.throwIfAborted();
-    const parent = this.session.agents.get(this.ownerAgentId);
-    if (parent === undefined) {
-      throw new Error(`Parent agent "${this.ownerAgentId}" was not found`);
-    }
-
+    const parent = this.requireParentAgent();
     const profile = this.resolveProfile(parent, options.profileName);
     const { id, agent } = await this.session.createAgent(
       { type: 'sub', generate: parent.rawGenerate },
@@ -122,54 +103,32 @@ export class SessionSubagentHost {
     });
 
     this.emitSubagentSpawned(parent, id, profile.name, options);
-    let started = false;
-    const cleanup = (): void => {
+    const completion = this.runChild(
+      parent,
+      id,
+      agent,
+      profile.name,
+      {
+        ...options,
+        signal: controller.signal,
+      },
+      () => this.configureChild(parent, agent, profile),
+      false,
+    ).finally(() => {
       unlinkAbortSignal();
       this.activeChildren.delete(id);
-    };
-
+    });
     return {
       agentId: id,
       profileName: profile.name,
-      start: () => {
-        if (started) {
-          throw new Error(`Subagent "${id}" has already been started`);
-        }
-        started = true;
-        const completion = this.runChild(
-          parent,
-          id,
-          agent,
-          profile.name,
-          {
-            ...options,
-            signal: controller.signal,
-          },
-          () => this.configureChild(parent, agent, profile),
-          false,
-        ).finally(cleanup);
-        return {
-          agentId: id,
-          profileName: profile.name,
-          resumed: false,
-          completion,
-        };
-      },
-      cancel: (reason) => {
-        controller.abort(reason);
-        if (!started) cleanup();
-      },
+      resumed: false,
+      completion,
     };
   }
 
   async resume(agentId: string, options: RunSubagentOptions): Promise<SubagentHandle> {
     options.signal.throwIfAborted();
-
-    const parent = this.session.agents.get(this.ownerAgentId);
-    if (parent === undefined) {
-      throw new Error(`Parent agent "${this.ownerAgentId}" was not found`);
-    }
-
+    const parent = this.requireParentAgent();
     const child = this.session.agents.get(agentId);
     if (child === undefined) {
       throw new Error(`Agent instance "${agentId}" was not found`);
@@ -232,14 +191,6 @@ export class SessionSubagentHost {
     return await this.launchQueue.run(tasks, options);
   }
 
-  async runQueuedTask<T>(
-    task: QueuedSubagentTask<T>,
-    options: QueuedSubagentRunOptions,
-  ): Promise<QueuedSubagentRunHandle<T>> {
-    const prepared = await this.prepareQueuedTask(task, options);
-    return this.launchQueue.runPrepared(prepared, options);
-  }
-
   cancelAll(reason: unknown = userCancellationReason()): void {
     const foregroundChildren = Array.from(this.activeChildren).filter(
       ([, child]) => !child.runInBackground,
@@ -260,27 +211,8 @@ export class SessionSubagentHost {
     return this.session.agents.get(agentId)?.config.profileName;
   }
 
-  async prepareQueuedTask<T>(
+  async runQueuedTaskAttempt<T>(
     task: QueuedSubagentTask<T>,
-    options: QueuedSubagentRunOptions,
-  ): Promise<PreparedQueuedSubagentTask<T>> {
-    const prepared = await this.prepareSubagent({
-      ...task,
-      signal: options.signal,
-    });
-    return {
-      task,
-      agentId: prepared.agentId,
-      profileName: prepared.profileName,
-      start: (runOptions, totalTimedOut) =>
-        this.startQueuedTask(task, prepared, runOptions, totalTimedOut),
-      cancel: prepared.cancel,
-    };
-  }
-
-  private async startQueuedTask<T>(
-    task: QueuedSubagentTask<T>,
-    prepared: PreparedSubagent,
     options: QueuedSubagentRunOptions,
     totalTimedOut: () => boolean,
   ): Promise<QueuedSubagentAttemptOutcome<T>> {
@@ -289,14 +221,13 @@ export class SessionSubagentHost {
         ? undefined
         : createDeadlineAbortSignal(options.signal, options.timeoutMs);
     const runSignal = subagentDeadline?.signal ?? options.signal;
-    const unlinkSubagentDeadline =
-      subagentDeadline === undefined
-        ? undefined
-        : this.linkChildAbortSignal(prepared.agentId, subagentDeadline.signal);
     let handle: SubagentHandle | undefined;
     try {
       runSignal.throwIfAborted();
-      handle = prepared.start();
+      handle = await this.spawn({
+        ...task,
+        signal: runSignal,
+      });
       const completion = await handle.completion;
       return {
         kind: 'result',
@@ -313,12 +244,15 @@ export class SessionSubagentHost {
       if (isRateLimit429Error(error)) {
         return { kind: 'rate_limited', task };
       }
+      if (handle === undefined) {
+        throw error;
+      }
       return {
         kind: 'result',
         result: {
           task,
-          agentId: prepared.agentId,
-          profileName: prepared.profileName,
+          agentId: handle.agentId,
+          profileName: handle.profileName,
           status: 'failed',
           error: formatQueuedSubagentError(error, runSignal, {
             subagentTimedOut: () => subagentDeadline?.timedOut() === true,
@@ -329,15 +263,16 @@ export class SessionSubagentHost {
         },
       };
     } finally {
-      unlinkSubagentDeadline?.();
       subagentDeadline?.clear();
     }
   }
 
-  private linkChildAbortSignal(agentId: string, signal: AbortSignal): () => void {
-    const child = this.activeChildren.get(agentId);
-    if (child === undefined) return () => undefined;
-    return linkAbortSignal(signal, child.controller);
+  private requireParentAgent(): Agent {
+    const parent = this.session.agents.get(this.ownerAgentId);
+    if (parent === undefined) {
+      throw new Error(`Parent agent "${this.ownerAgentId}" was not found`);
+    }
+    return parent;
   }
 
   private resolveProfile(parent: Agent, profileName: string): ResolvedAgentProfile {

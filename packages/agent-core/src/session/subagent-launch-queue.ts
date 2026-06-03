@@ -60,29 +60,12 @@ type QueuedSubagentAttempt<T> = {
   settled: boolean;
 };
 
-export type PreparedQueuedSubagentTask<T = unknown> = {
-  readonly task: QueuedSubagentTask<T>;
-  readonly agentId: string;
-  readonly profileName: string;
-  readonly start: (
+type SubagentLaunchQueueHost = {
+  readonly runQueuedTaskAttempt: <T>(
+    task: QueuedSubagentTask<T>,
     options: QueuedSubagentRunOptions,
     totalTimedOut: () => boolean,
   ) => Promise<QueuedSubagentAttemptOutcome<T>>;
-  readonly cancel: (reason: unknown) => void;
-};
-
-export type QueuedSubagentRunHandle<T = unknown> = {
-  readonly task: QueuedSubagentTask<T>;
-  readonly agentId: string;
-  readonly profileName: string;
-  readonly completion: Promise<QueuedSubagentRunResult<T>>;
-};
-
-type SubagentLaunchQueueHost = {
-  readonly prepareQueuedTask: <T>(
-    task: QueuedSubagentTask<T>,
-    options: QueuedSubagentRunOptions,
-  ) => Promise<PreparedQueuedSubagentTask<T>>;
 };
 
 export class SubagentLaunchQueue {
@@ -92,34 +75,6 @@ export class SubagentLaunchQueue {
     tasks: readonly QueuedSubagentTask<T>[],
     options: QueuedSubagentRunOptions,
   ): Promise<Array<QueuedSubagentRunResult<T>>> {
-    const prepared = await Promise.all(
-      tasks.map((task) => this.host.prepareQueuedTask(task, options)),
-    );
-    return await this.runPreparedBatch(prepared, options);
-  }
-
-  runPrepared<T>(
-    prepared: PreparedQueuedSubagentTask<T>,
-    options: QueuedSubagentRunOptions,
-  ): QueuedSubagentRunHandle<T> {
-    return {
-      task: prepared.task,
-      agentId: prepared.agentId,
-      profileName: prepared.profileName,
-      completion: this.runPreparedBatch([prepared], options).then((results) => {
-        const result = results[0];
-        if (result === undefined) {
-          throw new Error('Queued subagent finished without a result.');
-        }
-        return result;
-      }),
-    };
-  }
-
-  private async runPreparedBatch<T>(
-    prepared: readonly PreparedQueuedSubagentTask<T>[],
-    options: QueuedSubagentRunOptions,
-  ): Promise<Array<QueuedSubagentRunResult<T>>> {
     let totalDeadline: ReturnType<typeof createDeadlineAbortSignal> | undefined;
     try {
       totalDeadline =
@@ -127,7 +82,7 @@ export class SubagentLaunchQueue {
           ? undefined
           : createDeadlineAbortSignal(options.signal, options.totalTimeoutMs);
       return await this.runWithSignal(
-        prepared,
+        tasks,
         {
           signal: totalDeadline?.signal ?? options.signal,
           timeoutMs: options.timeoutMs,
@@ -141,19 +96,16 @@ export class SubagentLaunchQueue {
   }
 
   private async runWithSignal<T>(
-    prepared: readonly PreparedQueuedSubagentTask<T>[],
+    tasks: readonly QueuedSubagentTask<T>[],
     options: QueuedSubagentRunOptions,
     totalTimedOut: () => boolean,
   ): Promise<Array<QueuedSubagentRunResult<T>>> {
-    const tasks = prepared.map((task) => task.task);
     const pending = [...tasks];
     const queued: Array<QueuedSubagentTask<T>> = [];
-    const queuedTasks = new Set<QueuedSubagentTask<T>>();
     const active: Array<QueuedSubagentAttempt<T>> = [];
     const results: Array<QueuedSubagentRunResult<T> | undefined> = Array.from({
       length: tasks.length,
     });
-    const preparedTasks = new Map<QueuedSubagentTask<T>, PreparedQueuedSubagentTask<T>>();
     const taskIndexes = new Map(tasks.map((task, index) => [task, index]));
     let completedResults = 0;
     let launchedDuringRamp = 0;
@@ -168,26 +120,24 @@ export class SubagentLaunchQueue {
     };
 
     const enqueue = (task: QueuedSubagentTask<T>): void => {
-      if (results[resultIndex(task)] !== undefined || queuedTasks.has(task)) return;
-      queuedTasks.add(task);
-      queued.push(task);
-      queued.sort((left, right) => resultIndex(left) - resultIndex(right));
+      if (results[resultIndex(task)] !== undefined || queued.includes(task)) return;
+      const insertAt = queued.findIndex((queuedTask) => resultIndex(queuedTask) > resultIndex(task));
+      if (insertAt === -1) {
+        queued.push(task);
+      } else {
+        queued.splice(insertAt, 0, task);
+      }
     };
 
     const dequeue = (): QueuedSubagentTask<T> | undefined => {
-      const task = queued.shift();
-      if (task !== undefined) queuedTasks.delete(task);
-      return task;
+      return queued.shift();
     };
 
-    const launch = async (task: QueuedSubagentTask<T>): Promise<void> => {
-      const prepared =
-        preparedTasks.get(task) ?? (await this.host.prepareQueuedTask(task, options));
-      preparedTasks.delete(task);
+    const launch = (task: QueuedSubagentTask<T>): void => {
       const attempt: QueuedSubagentAttempt<T> = {
         task,
         settled: false,
-        promise: prepared.start(options, totalTimedOut),
+        promise: this.host.runQueuedTaskAttempt(task, options, totalTimedOut),
       };
       void attempt.promise.then(
         () => {
@@ -223,15 +173,8 @@ export class SubagentLaunchQueue {
     };
 
     try {
-      for (const task of prepared) {
-        preparedTasks.set(task.task, task);
-      }
-
-      while (
-        pending.length > 0 &&
-        launchedDuringRamp < SUBAGENT_MAX_INITIAL_LAUNCHES &&
-        !rateLimitSeen
-      ) {
+      while (pending.length > 0 && launchedDuringRamp < SUBAGENT_MAX_INITIAL_LAUNCHES) {
+        if (rateLimitSeen) break;
         const batchSize = Math.min(
           SUBAGENT_LAUNCH_BATCH_SIZE,
           pending.length,
@@ -240,7 +183,7 @@ export class SubagentLaunchQueue {
         for (let i = 0; i < batchSize; i += 1) {
           const task = pending.shift();
           if (task === undefined) break;
-          await launch(task);
+          launch(task);
           launchedDuringRamp += 1;
         }
         if (pending.length === 0 || launchedDuringRamp >= SUBAGENT_MAX_INITIAL_LAUNCHES) break;
@@ -279,7 +222,7 @@ export class SubagentLaunchQueue {
         if (!openedSlot || queued.length === 0) continue;
         await sleepWithSignal(SUBAGENT_QUEUE_LAUNCH_DELAY_MS, options.signal);
         const task = dequeue();
-        if (task !== undefined) await launch(task);
+        if (task !== undefined) launch(task);
       }
     } catch (error) {
       if (!totalTimedOut()) throw error;
@@ -289,8 +232,6 @@ export class SubagentLaunchQueue {
         if (results[index] !== undefined) continue;
         results[index] = failedQueuedResult(task, message);
       }
-    } finally {
-      cancelPreparedTasks(preparedTasks);
     }
 
     return results.map((result, index) => {
@@ -310,16 +251,6 @@ function failedQueuedResult<T>(
     status: 'failed',
     error,
   };
-}
-
-function cancelPreparedTasks<T>(
-  preparedTasks: Map<QueuedSubagentTask<T>, PreparedQueuedSubagentTask<T>>,
-): void {
-  const reason = new Error('Subagent queue stopped before the prompt was launched.');
-  for (const task of preparedTasks.values()) {
-    task.cancel(reason);
-  }
-  preparedTasks.clear();
 }
 
 async function waitForRateLimitOrDelay<T>(

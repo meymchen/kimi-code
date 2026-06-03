@@ -25,8 +25,6 @@ import { isAbortError } from '../../../loop/errors';
 import type { ExecutableToolContext, ExecutableToolResult, ToolExecution } from '../../../loop/types';
 import type { ResolvedAgentProfile } from '../../../profile';
 import type {
-  QueuedSubagentRunResult,
-  QueuedSubagentTask,
   SessionSubagentHost,
   SubagentHandle,
 } from '../../../session/subagent-host';
@@ -217,26 +215,10 @@ export class AgentTool implements BuiltinTool<AgentToolInput> {
           handle = await this.subagentHost.resume(resumeAgentId, options);
         } else {
           const profileName = requestedProfileName ?? 'coder';
-          const queued = await this.subagentHost.runQueuedTask(
-            {
-              data: undefined,
-              profileName,
-              parentToolCallId: options.parentToolCallId,
-              prompt: options.prompt,
-              description: options.description,
-              runInBackground: options.runInBackground,
-            } satisfies QueuedSubagentTask,
-            {
-              signal: options.signal,
-              timeoutMs,
-            },
-          );
-          handle = {
-            agentId: queued.agentId,
-            profileName: queued.profileName,
-            resumed: false,
-            completion: queued.completion.then(queuedResultToCompletion),
-          };
+          handle = await this.subagentHost.spawn({
+            profileName,
+            ...options,
+          });
         }
       } catch (error) {
         this.log?.warn('subagent launch failed', {
@@ -341,18 +323,6 @@ export class AgentTool implements BuiltinTool<AgentToolInput> {
       foregroundDeadline?.clear();
     }
   }
-}
-
-function queuedResultToCompletion(
-  result: QueuedSubagentRunResult,
-): Awaited<SubagentHandle['completion']> {
-  if (result.status === 'completed') {
-    return {
-      result: result.result ?? '',
-      usage: result.usage,
-    };
-  }
-  throw new Error(result.error ?? 'Subagent failed.');
 }
 
 function buildSubagentDescriptions(subagents: ResolvedAgentProfile['subagents']): string {
