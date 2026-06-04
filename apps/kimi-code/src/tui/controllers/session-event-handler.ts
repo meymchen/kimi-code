@@ -279,7 +279,7 @@ export class SessionEventHandler {
         if (isUserCancelledSubagentError(event.error)) {
           swarmProgress.markCancelled(event.subagentId);
         } else {
-          swarmProgress.markFailed(event.subagentId);
+          swarmProgress.markFailed(event.subagentId, event.error);
         }
       }
       this.host.setAgentSwarmProgress(swarmProgress);
@@ -337,7 +337,6 @@ export class SessionEventHandler {
       case 'cron.fired':
       case 'error':
       case 'warning':
-      case 'goal.updated':
       case 'session.meta.updated':
       case 'skill.activated':
       case 'goal.updated':
@@ -971,7 +970,7 @@ export class SessionEventHandler {
     }
     const swarmProgress = this.agentSwarmProgress.get(event.parentToolCallId);
     if (swarmProgress !== undefined) {
-      swarmProgress.markCompleted(event.subagentId);
+      swarmProgress.markCompleted(event.subagentId, event.resultSummary);
       this.host.setAgentSwarmProgress(swarmProgress);
       streamingUI.removeToolComponentIfInactive(event.parentToolCallId);
       return;
@@ -1024,7 +1023,7 @@ export class SessionEventHandler {
       if (isUserCancelledSubagentError(event.error)) {
         swarmProgress.markCancelled(event.subagentId);
       } else {
-        swarmProgress.markFailed(event.subagentId);
+        swarmProgress.markFailed(event.subagentId, event.error);
       }
       this.host.setAgentSwarmProgress(swarmProgress);
       streamingUI.removeToolComponentIfInactive(event.parentToolCallId);

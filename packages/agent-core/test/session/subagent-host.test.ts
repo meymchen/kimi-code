@@ -4,10 +4,10 @@ import { join } from 'pathe';
 
 import { createControlledPromise } from '@antfu/utils';
 import { testKaos } from '../fixtures/test-kaos';
-import type { ToolCall } from '@moonshot-ai/kosong';
+import { APIStatusError, type Message, type ToolCall } from '@moonshot-ai/kosong';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import type { Agent } from '../../src/agent';
+import type { Agent, AgentOptions } from '../../src/agent';
 import { AGENT_WIRE_PROTOCOL_VERSION } from '../../src/agent/records';
 import type { ResolvedAgentProfile } from '../../src/profile';
 import type { SDKSessionRPC } from '../../src/rpc';
@@ -34,6 +34,7 @@ const signal = new AbortController().signal;
 const rateLimit429Message =
   "429 We're receiving too many requests at the moment. Please wait a moment and try again.";
 const tempDirs: string[] = [];
+type GenerateFn = NonNullable<AgentOptions['generate']>;
 
 afterEach(async () => {
   for (const dir of tempDirs.splice(0)) {
@@ -42,74 +43,58 @@ afterEach(async () => {
 });
 
 describe('SessionSubagentHost', () => {
-  it('runQueued launches the next batch after every current batch member emits output', async () => {
-    const host = new SessionSubagentHost({} as Session, 'main');
-    const launches: Array<
-      ReturnType<typeof createControlledPromise<{ result: string }>> & { readonly ready: () => void }
-    > = [];
-    const spawn = vi.spyOn(host, 'spawn').mockImplementation((options) => {
-      const completion = Object.assign(createControlledPromise<{ result: string }>(), {
-        ready: options.onFirstOutput ?? (() => {}),
+  it('runQueued keeps launching batches after the readiness window elapses', async () => {
+    vi.useFakeTimers();
+    try {
+      const host = new SessionSubagentHost({} as Session, 'main');
+      const launches: Array<ReturnType<typeof createControlledPromise<{ result: string }>>> = [];
+      const spawn = vi.spyOn(host, 'spawn').mockImplementation((options) => {
+        const completion = createControlledPromise<{ result: string }>();
+        launches.push(completion);
+        return Promise.resolve({
+          agentId: `agent-${String(launches.length)}`,
+          profileName: options.profileName,
+          resumed: false,
+          completion,
+        } satisfies SubagentHandle);
       });
-      launches.push(completion);
-      return Promise.resolve({
-        agentId: `agent-${String(launches.length)}`,
-        profileName: options.profileName,
-        resumed: false,
-        completion,
-      } satisfies SubagentHandle);
-    });
 
-    const running = host.runQueued(
-      Array.from({ length: 41 }, (_, index) => queuedTask(index + 1)),
-      { signal },
-    );
+      const running = host.runQueued(
+        Array.from({ length: 41 }, (_, index) => queuedTask(index + 1)),
+        { signal },
+      );
 
-    await flushPromises();
-    expect(spawn).toHaveBeenCalledTimes(10);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(spawn).toHaveBeenCalledTimes(10);
 
-    launches.slice(0, 9).forEach((launch) => {
-      launch.ready();
-    });
-    await flushPromises();
-    expect(spawn).toHaveBeenCalledTimes(10);
+      await vi.advanceTimersByTimeAsync(499);
+      expect(spawn).toHaveBeenCalledTimes(10);
 
-    launches[9]!.ready();
-    await vi.waitFor(() => {
+      await vi.advanceTimersByTimeAsync(1);
       expect(spawn).toHaveBeenCalledTimes(20);
-    });
 
-    launches.slice(10, 20).forEach((launch) => {
-      launch.ready();
-    });
-    await vi.waitFor(() => {
+      await vi.advanceTimersByTimeAsync(500);
       expect(spawn).toHaveBeenCalledTimes(30);
-    });
 
-    launches.slice(20, 30).forEach((launch) => {
-      launch.ready();
-    });
-    await vi.waitFor(() => {
+      await vi.advanceTimersByTimeAsync(500);
       expect(spawn).toHaveBeenCalledTimes(40);
-    });
 
-    launches.slice(30, 40).forEach((launch) => {
-      launch.ready();
-    });
-    await vi.waitFor(() => {
+      await vi.advanceTimersByTimeAsync(500);
       expect(spawn).toHaveBeenCalledTimes(41);
-    });
 
-    launches.forEach((completion, index) => {
-      completion.resolve({ result: `result ${String(index + 1)}` });
-    });
-    const results = await running;
+      launches.forEach((completion, index) => {
+        completion.resolve({ result: `result ${String(index + 1)}` });
+      });
+      const results = await running;
 
-    expect(results).toHaveLength(41);
-    expect(results.every((result) => result.status === 'completed')).toBe(true);
+      expect(results).toHaveLength(41);
+      expect(results.every((result) => result.status === 'completed')).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
-  it('runQueued locks slots to launched minus two after the first 429', async () => {
+  it('runQueued retries the same subagent and decrements slots by one after a 429', async () => {
     vi.useFakeTimers();
     try {
       const controller = new AbortController();
@@ -135,6 +120,21 @@ describe('SessionSubagentHost', () => {
             completion,
           } satisfies SubagentHandle);
         });
+      const retry = vi
+        .spyOn(host, 'retry')
+        .mockImplementation((agentId, options) => {
+          const completion = Object.assign(createControlledPromise<{ result: string }>(), {
+            prompt: options.prompt,
+            ready: options.onFirstOutput ?? (() => {}),
+          });
+          launches.push(completion);
+          return Promise.resolve({
+            agentId,
+            profileName: 'coder',
+            resumed: true,
+            completion,
+          } satisfies SubagentHandle);
+        });
 
       const running = host.runQueued(
         Array.from({ length: 21 }, (_, index) => queuedTask(index + 1)),
@@ -154,18 +154,13 @@ describe('SessionSubagentHost', () => {
       launches[14]!.reject(new Error(rateLimit429Message));
       await vi.advanceTimersByTimeAsync(0);
       expect(spawn).toHaveBeenCalledTimes(20);
+      expect(retry).not.toHaveBeenCalled();
 
       launches[0]!.resolve({ result: 'opened slot 1' });
-      await vi.advanceTimersByTimeAsync(500);
+      await vi.advanceTimersByTimeAsync(1000);
       expect(spawn).toHaveBeenCalledTimes(20);
-
-      launches[1]!.resolve({ result: 'opened slot 2' });
-      await vi.advanceTimersByTimeAsync(499);
-      expect(spawn).toHaveBeenCalledTimes(20);
-
-      await vi.advanceTimersByTimeAsync(1);
-      expect(spawn).toHaveBeenCalledTimes(21);
-      expect(spawn).toHaveBeenLastCalledWith({
+      expect(retry).toHaveBeenCalledTimes(1);
+      expect(retry).toHaveBeenLastCalledWith('agent-15', {
         data: 15,
         profileName: 'coder',
         parentToolCallId: 'call_swarm',
@@ -174,7 +169,148 @@ describe('SessionSubagentHost', () => {
         runInBackground: false,
         signal: controller.signal,
         onFirstOutput: expect.any(Function),
+        suppressRateLimitFailureEvent: true,
       });
+
+      controller.abort();
+      await expect(running).rejects.toThrow();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('runQueued puts rate-limited subagents at the front of the queue', async () => {
+    vi.useFakeTimers();
+    try {
+      const controller = new AbortController();
+      const host = new SessionSubagentHost({} as Session, 'main');
+      const launches: Array<
+        ReturnType<typeof createControlledPromise<{ result: string }>> & {
+          readonly ready: () => void;
+        }
+      > = [];
+      vi.spyOn(host, 'spawn').mockImplementation((options) => {
+        const completion = Object.assign(createControlledPromise<{ result: string }>(), {
+          ready: options.onFirstOutput ?? (() => {}),
+        });
+        launches.push(completion);
+        return Promise.resolve({
+          agentId: `agent-${String(launches.length)}`,
+          profileName: options.profileName,
+          resumed: false,
+          completion,
+        } satisfies SubagentHandle);
+      });
+      const retry = vi.spyOn(host, 'retry').mockImplementation((agentId, options) => {
+        const completion = Object.assign(createControlledPromise<{ result: string }>(), {
+          ready: options.onFirstOutput ?? (() => {}),
+        });
+        launches.push(completion);
+        return Promise.resolve({
+          agentId,
+          profileName: 'coder',
+          resumed: true,
+          completion,
+        } satisfies SubagentHandle);
+      });
+
+      const running = host.runQueued(
+        Array.from({ length: 12 }, (_, index) => queuedTask(index + 1)),
+        { signal: controller.signal },
+      );
+      void running.catch(() => {});
+
+      await vi.advanceTimersByTimeAsync(0);
+      expect(launches).toHaveLength(10);
+      launches.slice(0, 10).forEach((launch) => {
+        launch.ready();
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(launches).toHaveLength(12);
+
+      launches[0]!.reject(new Error(rateLimit429Message));
+      await vi.advanceTimersByTimeAsync(0);
+      launches[4]!.reject(new Error(rateLimit429Message));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(retry).not.toHaveBeenCalled();
+
+      launches[1]!.resolve({ result: 'opened retry slot' });
+      await vi.advanceTimersByTimeAsync(500);
+      expect(retry).toHaveBeenCalledTimes(1);
+      expect(retry).toHaveBeenLastCalledWith('agent-5', {
+        data: 5,
+        profileName: 'coder',
+        parentToolCallId: 'call_swarm',
+        prompt: 'Review item-5',
+        description: 'Review #5',
+        runInBackground: false,
+        signal: controller.signal,
+        onFirstOutput: expect.any(Function),
+        suppressRateLimitFailureEvent: true,
+      });
+
+      controller.abort();
+      await expect(running).rejects.toThrow();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('runQueued caps 429 slot reductions at three per second', async () => {
+    vi.useFakeTimers();
+    try {
+      const controller = new AbortController();
+      const host = new SessionSubagentHost({} as Session, 'main');
+      const launches: Array<
+        ReturnType<typeof createControlledPromise<{ result: string }>> & {
+          readonly ready: () => void;
+        }
+      > = [];
+      vi.spyOn(host, 'spawn').mockImplementation((options) => {
+        const completion = Object.assign(createControlledPromise<{ result: string }>(), {
+          ready: options.onFirstOutput ?? (() => {}),
+        });
+        launches.push(completion);
+        return Promise.resolve({
+          agentId: `agent-${String(launches.length)}`,
+          profileName: options.profileName,
+          resumed: false,
+          completion,
+        } satisfies SubagentHandle);
+      });
+      const retry = vi.spyOn(host, 'retry').mockImplementation((agentId, options) => {
+        const completion = Object.assign(createControlledPromise<{ result: string }>(), {
+          ready: options.onFirstOutput ?? (() => {}),
+        });
+        launches.push(completion);
+        return Promise.resolve({
+          agentId,
+          profileName: 'coder',
+          resumed: true,
+          completion,
+        } satisfies SubagentHandle);
+      });
+
+      const running = host.runQueued(
+        Array.from({ length: 14 }, (_, index) => queuedTask(index + 1)),
+        { signal: controller.signal },
+      );
+      void running.catch(() => {});
+
+      await vi.advanceTimersByTimeAsync(0);
+      expect(launches).toHaveLength(10);
+      launches.slice(0, 10).forEach((launch) => {
+        launch.ready();
+      });
+
+      for (const launch of launches.slice(0, 4)) {
+        launch.reject(new Error(rateLimit429Message));
+        await vi.advanceTimersByTimeAsync(0);
+      }
+
+      expect(retry).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(500);
+      expect(retry).toHaveBeenCalledTimes(1);
 
       controller.abort();
       await expect(running).rejects.toThrow();
@@ -185,16 +321,7 @@ describe('SessionSubagentHost', () => {
 
   it('runQueued reports an error when every initial launch hits 429', async () => {
     const host = new SessionSubagentHost({} as Session, 'main');
-    vi.spyOn(host, 'spawn').mockImplementation((options) => {
-      return Promise.resolve({
-        agentId: 'agent-rate-limited',
-        profileName: options.profileName,
-        resumed: false,
-        completion: Promise.resolve().then(() => {
-          throw new Error(rateLimit429Message);
-        }),
-      } satisfies SubagentHandle);
-    });
+    vi.spyOn(host, 'spawn').mockRejectedValue(new Error(rateLimit429Message));
 
     await expect(
       host.runQueued(
@@ -997,6 +1124,67 @@ describe('SessionSubagentHost', () => {
     );
   });
 
+  it('retries a rate-limited child turn without appending the original prompt again', async () => {
+    const parent = testAgent();
+    parent.configure();
+    parent.newEvents();
+
+    const summary =
+      'Recovered from a provider rate limit by retrying the latest subagent step with the original context intact, then completed the delegated work with a detailed enough summary for the parent to continue confidently. '.repeat(
+        2,
+      );
+    const histories: Message[][] = [];
+    let generateCalls = 0;
+    const generate: GenerateFn = async (
+      _provider,
+      _systemPrompt,
+      _tools,
+      history,
+      callbacks,
+    ) => {
+      histories.push(structuredClone(history));
+      generateCalls += 1;
+      if (generateCalls === 1) {
+        throw new APIStatusError(429, 'Rate limited', 'req-429');
+      }
+      await callbacks?.onMessagePart?.({ type: 'text', text: summary });
+      return textResult(summary);
+    };
+    const child = testAgent({
+      generate,
+      initialConfig: {
+        providers: {},
+        loopControl: { maxRetriesPerStep: 1 },
+      },
+    });
+    child.configure();
+
+    const session = fakeSession(parent.agent, child.agent);
+    const host = new SessionSubagentHost(session, 'main');
+
+    const handle = await host.spawn({
+      profileName: 'coder',
+      parentToolCallId: 'call_agent',
+      prompt: 'Implement the retry-safe change',
+      description: 'Fix rate-limit retry',
+      runInBackground: false,
+      signal,
+    });
+    await expect(handle.completion).rejects.toThrow('provider.rate_limit');
+
+    const retryHandle = await host.retry(handle.agentId, {
+      parentToolCallId: 'call_agent',
+      prompt: 'Implement the retry-safe change',
+      description: 'Fix rate-limit retry',
+      runInBackground: false,
+      signal,
+    });
+
+    await expect(retryHandle.completion).resolves.toMatchObject({ result: summary.trim() });
+    expect(generateCalls).toBe(2);
+    expect(userTextMessages(histories[1] ?? [])).toEqual(['Implement the retry-safe change']);
+  });
+
   it('realigns a resumed subagent to the parent agent current model', async () => {
     const parent = testAgent();
     parent.configure();
@@ -1458,6 +1646,36 @@ function queuedTask(index: number): QueuedSubagentTask<number> {
     description: `Review #${String(index)}`,
     runInBackground: false,
   };
+}
+
+function textResult(text: string): Awaited<ReturnType<GenerateFn>> {
+  return {
+    id: 'mock-text',
+    message: {
+      role: 'assistant',
+      content: [{ type: 'text', text }],
+      toolCalls: [],
+    },
+    usage: {
+      inputOther: 0,
+      output: 0,
+      inputCacheRead: 0,
+      inputCacheCreation: 0,
+    },
+    finishReason: 'completed',
+    rawFinishReason: 'stop',
+  };
+}
+
+function userTextMessages(history: readonly Message[]): string[] {
+  return history
+    .filter((message) => message.role === 'user')
+    .map((message) =>
+      message.content
+        .filter((part) => part.type === 'text')
+        .map((part) => part.text)
+        .join(''),
+    );
 }
 
 async function writeWire(homedir: string, records: readonly Record<string, unknown>[]) {

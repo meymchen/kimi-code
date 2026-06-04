@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
   AgentSwarmProgressComponent,
@@ -7,11 +7,16 @@ import {
   agentSwarmPartialItemsCountFromArguments,
   agentSwarmPartialItemsFromArguments,
 } from '#/tui/components/messages/agent-swarm-progress';
+import { AgentSwarmProgressEstimator } from '#/tui/components/messages/agent-swarm-progress-estimator';
 import { darkColors } from '#/tui/theme/colors';
 
 function strip(text: string): string {
   return text.replaceAll(/\u001B\[[0-9;]*m/g, '');
 }
+
+afterEach(() => {
+  vi.useRealTimers();
+});
 
 describe('AgentSwarmProgressComponent', () => {
   it('renders an orchestrating panel before subagents spawn', () => {
@@ -27,7 +32,7 @@ describe('AgentSwarmProgressComponent', () => {
     expect(output).not.toContain('01');
   });
 
-  it('renders spawned subagents as queued progress rows', () => {
+  it('renders spawned subagents as queued rows without empty progress bars', () => {
     const component = new AgentSwarmProgressComponent({
       description: 'Review changed files',
       colors: darkColors,
@@ -38,13 +43,14 @@ describe('AgentSwarmProgressComponent', () => {
 
     const output = strip(component.render(100).join('\n'));
 
-    expect(output).toContain('001 [');
-    expect(output).toContain('002 [');
-    expect(output).toContain('Queued');
+    expect(output).toContain('001 Queued...');
+    expect(output).toContain('002 Queued...');
+    expect(output).not.toContain('001 [');
+    expect(output).not.toContain('002 [');
     expect(output).not.toContain('agents=2');
   });
 
-  it('advances one step when a subagent tool call starts and marks terminal states', () => {
+  it('advances from queued when a subagent tool call starts and marks terminal states', () => {
     const component = new AgentSwarmProgressComponent({
       description: 'Review changed files',
       colors: darkColors,
@@ -57,17 +63,132 @@ describe('AgentSwarmProgressComponent', () => {
     let output = strip(component.render(100).join('\n'));
     expect(output).toContain('001 [');
     expect(output).toContain('Running');
-    expect(output).toContain('002 [');
-    expect(output).toContain('Queued');
+    expect(output).toContain('002 Queued...');
+    expect(output).not.toContain('002 [');
 
     component.markCompleted('agent-1');
     component.markFailed('agent-2');
 
     output = strip(component.render(100).join('\n'));
     expect(output).toContain('001 [');
-    expect(output).toContain('Completed');
+    expect(output).toContain('✓');
+    expect(output).not.toContain('Completed');
     expect(output).toContain('002 [');
     expect(output).toContain('Failed');
+  });
+
+  it('renders completed subagent output with a success mark', () => {
+    const component = new AgentSwarmProgressComponent({
+      description: 'Review changed files',
+      colors: darkColors,
+    });
+
+    component.registerSubagent({ agentId: 'agent-1', description: 'Review changed files #1 (coder)' });
+    component.markCompleted('agent-1', 'Reviewed imports and found no regressions');
+
+    const output = strip(component.render(100).join('\n'));
+
+    expect(output).toContain('✓ Reviewed imports and found no regressions');
+    expect(output).not.toContain('Completed');
+  });
+
+  it('renders failure details from live subagent failures', () => {
+    const component = new AgentSwarmProgressComponent({
+      description: 'Review changed files',
+      colors: darkColors,
+    });
+
+    component.registerSubagent({ agentId: 'agent-1', description: 'Review changed files #1 (coder)' });
+    component.markFailed('agent-1', 'Provider request failed\nRetry budget exhausted');
+
+    const output = strip(component.render(100).join('\n'));
+
+    expect(output).toContain('Failed: Provider request failed Retry budget exhausted');
+  });
+
+  it('renders failure details from AgentSwarm result output', () => {
+    const component = new AgentSwarmProgressComponent({
+      description: 'Review changed files',
+      colors: darkColors,
+    });
+
+    component.updateArgs({
+      description: 'Review changed files',
+      items: ['src/a.ts'],
+    });
+    component.applyResult([
+      'agent_swarm: failed',
+      'description: Review changed files',
+      'items: 1',
+      'completed: 0',
+      'failed: 1',
+      '',
+      '[agent 1]',
+      'agent_id: agent-1',
+      'item: "src/a.ts"',
+      'actual_subagent_type: coder',
+      'status: failed',
+      'description: Review changed files #1 (coder)',
+      '',
+      'subagent error: Agent timed out after 30s.',
+    ].join('\n'));
+
+    const output = strip(component.render(100).join('\n'));
+
+    expect(output).toContain('Failed: Agent timed out after 30s.');
+  });
+
+  it('renders completed summaries from AgentSwarm result output', () => {
+    const component = new AgentSwarmProgressComponent({
+      description: 'Review changed files',
+      colors: darkColors,
+    });
+
+    component.updateArgs({
+      description: 'Review changed files',
+      items: ['src/a.ts'],
+    });
+    component.applyResult([
+      'agent_swarm: completed',
+      'description: Review changed files',
+      'items: 1',
+      'completed: 1',
+      'failed: 0',
+      '',
+      '[agent 1]',
+      'agent_id: agent-1',
+      'item: "src/a.ts"',
+      'actual_subagent_type: coder',
+      'status: completed',
+      'description: Review changed files #1 (coder)',
+      '',
+      '[summary]',
+      'Reviewed src/a.ts and confirmed imports are stable.',
+    ].join('\n'));
+
+    const output = strip(component.render(100).join('\n'));
+
+    expect(output).toContain('✓ Reviewed src/a.ts and confirmed imports are stable.');
+    expect(output).not.toContain('Completed');
+  });
+
+  it('uses the latest assistant line as completed output when no summary is available', () => {
+    const component = new AgentSwarmProgressComponent({
+      description: 'Review changed files',
+      colors: darkColors,
+    });
+
+    component.registerSubagent({ agentId: 'agent-1', description: 'Review changed files #1 (coder)' });
+    component.appendAssistantDelta({
+      agentId: 'agent-1',
+      delta: 'Reviewing src/a.ts\nImports look stable',
+    });
+    component.markCompleted('agent-1');
+
+    const output = strip(component.render(100).join('\n'));
+
+    expect(output).toContain('✓ Imports look stable');
+    expect(output).not.toContain('Completed');
   });
 
   it('shows latest assistant text after the progress bar with ellipsis truncation', () => {
@@ -91,6 +212,39 @@ describe('AgentSwarmProgressComponent', () => {
     expect(output).not.toContain('Working');
   });
 
+  it('renders boosted fractional progress ticks without leaking undefined cells', () => {
+    vi.useFakeTimers();
+    const component = new AgentSwarmProgressComponent({
+      description: 'Review changed files',
+      colors: darkColors,
+    });
+
+    vi.setSystemTime(0);
+    component.registerSubagent({ agentId: 'agent-1', description: 'Review changed files #1 (coder)' });
+    component.markStarted('agent-1');
+    for (let index = 0; index < 10; index += 1) {
+      vi.setSystemTime(1_000 + index * 1_000);
+      component.recordToolCall({ agentId: 'agent-1', toolCallId: `done-${index}` });
+    }
+    vi.setSystemTime(40_000);
+    component.markCompleted('agent-1');
+
+    component.registerSubagent({ agentId: 'agent-2', description: 'Review changed files #2 (coder)' });
+    component.markStarted('agent-2');
+    for (let index = 0; index < 3; index += 1) {
+      vi.setSystemTime(45_000 + index * 5_000);
+      component.recordToolCall({ agentId: 'agent-2', toolCallId: `running-${index}` });
+    }
+
+    vi.setSystemTime(60_000);
+    component.render(100);
+    vi.setSystemTime(61_000);
+    const output = strip(component.render(100).join('\n'));
+
+    expect(output).toContain('002 [');
+    expect(output).not.toContain('undefined');
+  });
+
   it('keeps spawned rows queued when AgentSwarm input completes', () => {
     const component = new AgentSwarmProgressComponent({
       description: 'Review changed files',
@@ -102,13 +256,13 @@ describe('AgentSwarmProgressComponent', () => {
       description: 'Review changed files #1 (coder)',
     });
     let output = strip(component.render(100).join('\n'));
-    expect(output).toContain('001 [');
-    expect(output).toContain('Queued');
+    expect(output).toContain('001 Queued...');
+    expect(output).not.toContain('001 [');
 
     component.markInputComplete();
     output = strip(component.render(100).join('\n'));
-    expect(output).toContain('001 [');
-    expect(output).toContain('Queued');
+    expect(output).toContain('001 Queued...');
+    expect(output).not.toContain('001 [');
   });
 
   it('creates pending rows from streamed args items', () => {
@@ -163,15 +317,16 @@ describe('AgentSwarmProgressComponent', () => {
 
     component.registerSubagent({ agentId: 'agent-1', description: 'Review changed files #1 (coder)' });
     let output = strip(component.render(100).join('\n'));
-    expect(output).toContain('001 [');
-    expect(output).toContain('Queued');
+    expect(output).toContain('001 Queued...');
+    expect(output).not.toContain('001 [');
     expect(output).not.toContain('002');
 
     component.registerSubagent({ agentId: 'agent-2', description: 'Review changed files #2 (coder)' });
     output = strip(component.render(100).join('\n'));
-    expect(output).toContain('001 [');
-    expect(output).toContain('002 [');
-    expect(output).toContain('Queued');
+    expect(output).toContain('001 Queued...');
+    expect(output).toContain('002 Queued...');
+    expect(output).not.toContain('001 [');
+    expect(output).not.toContain('002 [');
   });
 
   it('extracts description and item list from AgentSwarm args', () => {
@@ -182,5 +337,96 @@ describe('AgentSwarmProgressComponent', () => {
 
     expect(agentSwarmDescriptionFromArgs(args)).toBe('Review changed files');
     expect(agentSwarmItemsFromArgs(args)).toEqual(['src/a.ts', '123']);
+  });
+});
+
+describe('AgentSwarmProgressEstimator', () => {
+  it('counts a started subagent as one progress tick before tool calls arrive', () => {
+    const estimator = new AgentSwarmProgressEstimator();
+
+    estimator.markStarted('001', 0);
+    const estimate = estimator.estimate({
+      memberKey: '001',
+      phase: 'running',
+      capacityTicks: 56,
+      nowMs: 1_000,
+    });
+
+    expect(estimate.rawTicks).toBe(1);
+    expect(estimate.displayTicks).toBe(1);
+  });
+
+  it('keeps raw tool-call ticks without completed samples and deduplicates calls', () => {
+    const estimator = new AgentSwarmProgressEstimator();
+
+    estimator.markStarted('001', 0);
+    expect(
+      estimator.recordToolCall({ memberKey: '001', toolCallId: 'read', nowMs: 1_000 }),
+    ).toEqual({ accepted: true, rawTicks: 2 });
+    expect(
+      estimator.recordToolCall({ memberKey: '001', toolCallId: 'read', nowMs: 2_000 }),
+    ).toEqual({ accepted: false, rawTicks: 2 });
+
+    const estimate = estimator.estimate({
+      memberKey: '001',
+      phase: 'running',
+      capacityTicks: 56,
+      nowMs: 3_000,
+    });
+
+    expect(estimate.rawTicks).toBe(2);
+    expect(estimate.displayTicks).toBe(2);
+    expect(estimate.estimatedTotalToolCalls).toBeUndefined();
+    expect(estimate.boosted).toBe(false);
+  });
+
+  it('smoothly catches up toward completed-agent estimates without jumping to them', () => {
+    const estimator = new AgentSwarmProgressEstimator({
+      catchupTimeMs: 1_000,
+      maxCatchupTicksPerSecond: 100,
+    });
+
+    estimator.markStarted('001', 0);
+    for (let index = 0; index < 10; index += 1) {
+      estimator.recordToolCall({
+        memberKey: '001',
+        toolCallId: `done-${index}`,
+        nowMs: 1_000 + index * 1_000,
+      });
+    }
+    estimator.markCompleted('001', 40_000);
+
+    estimator.markStarted('002', 0);
+    for (let index = 0; index < 3; index += 1) {
+      estimator.recordToolCall({
+        memberKey: '002',
+        toolCallId: `running-${index}`,
+        nowMs: 5_000 + index * 5_000,
+      });
+    }
+
+    const first = estimator.estimate({
+      memberKey: '002',
+      phase: 'running',
+      capacityTicks: 56,
+      nowMs: 20_000,
+    });
+
+    expect(first.rawTicks).toBe(4);
+    expect(first.displayTicks).toBe(4);
+    expect(first.estimatedTotalToolCalls).toBeGreaterThan(4);
+    expect(first.targetTicks).toBeGreaterThan(4);
+    expect(estimator.hasPendingCatchup()).toBe(true);
+
+    const second = estimator.estimate({
+      memberKey: '002',
+      phase: 'running',
+      capacityTicks: 56,
+      nowMs: 21_000,
+    });
+
+    expect(second.displayTicks).toBeGreaterThan(4);
+    expect(second.displayTicks).toBeLessThan(second.targetTicks ?? 0);
+    expect(second.boosted).toBe(true);
   });
 });

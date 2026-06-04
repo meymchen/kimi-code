@@ -1,10 +1,15 @@
 import { truncateToWidth, visibleWidth, type Component } from '@earendil-works/pi-tui';
 import chalk from 'chalk';
 
+import {
+  AgentSwarmProgressEstimator,
+  type AgentSwarmProgressEstimatorPhase,
+} from '#/tui/components/messages/agent-swarm-progress-estimator';
+import { SUCCESS_MARK } from '#/tui/constant/symbols';
 import type { ColorPalette } from '#/tui/theme/colors';
 
 const MIN_CELL_WIDTH = 32;
-const CELL_GAP = '  ';
+const CELL_GAP = '    ';
 const FRAME_INTERVAL_MS = 80;
 const BRAILLE_BAR_MIN_WIDTH = 5;
 const BRAILLE_BAR_MAX_WIDTH = 8;
@@ -20,13 +25,7 @@ const FAILED_PLACEHOLDER_NON_RED_FACTOR = 0.25;
 const ORCHESTRATING_LABEL = 'Orchestrating...';
 const QUEUED_LABEL = 'Queued...';
 
-type AgentSwarmPhase =
-  | 'pending'
-  | 'queued'
-  | 'running'
-  | 'completed'
-  | 'failed'
-  | 'cancelled';
+type AgentSwarmPhase = AgentSwarmProgressEstimatorPhase;
 
 interface AgentSwarmMember {
   readonly id: string;
@@ -35,6 +34,8 @@ interface AgentSwarmMember {
   ticks: number;
   itemText: string;
   latestModelText: string;
+  completedText?: string;
+  failureText?: string;
   completedAtMs?: number;
   failedAtMs?: number;
 }
@@ -49,6 +50,8 @@ interface AgentSwarmSnapshot {
 interface AgentSwarmResultStatus {
   readonly index: number;
   readonly status: 'completed' | 'failed';
+  readonly completedText?: string;
+  readonly failureText?: string;
 }
 
 interface AgentSwarmSummary {
@@ -65,8 +68,8 @@ export interface AgentSwarmProgressOptions {
 }
 
 const PHASE_LABELS: Record<AgentSwarmPhase, string> = {
-  pending: 'Queued',
-  queued: 'Queued',
+  pending: QUEUED_LABEL,
+  queued: QUEUED_LABEL,
   running: 'Running',
   completed: 'Completed',
   failed: 'Failed',
@@ -75,7 +78,7 @@ const PHASE_LABELS: Record<AgentSwarmPhase, string> = {
 
 export class AgentSwarmProgressComponent implements Component {
   private members: AgentSwarmMember[];
-  private readonly seenToolCalls = new Set<string>();
+  private readonly progressEstimator = new AgentSwarmProgressEstimator();
   private description: string;
   private readonly colors: ColorPalette;
   private readonly requestRender: (() => void) | undefined;
@@ -140,6 +143,9 @@ export class AgentSwarmProgressComponent implements Component {
   markStarted(agentId: string): void {
     const member = this.findMemberByAgentId(agentId);
     if (member === undefined) return;
+    const nowMs = Date.now();
+    this.progressEstimator.markStarted(member.id, nowMs);
+    member.ticks = Math.max(member.ticks, 1);
     if (member.phase === 'pending' || member.phase === 'queued') {
       member.phase = 'running';
     }
@@ -150,15 +156,19 @@ export class AgentSwarmProgressComponent implements Component {
     readonly agentId: string;
     readonly toolCallId: string;
   }): void {
-    const key = `${input.agentId}:${input.toolCallId}`;
-    if (this.seenToolCalls.has(key)) return;
-    this.seenToolCalls.add(key);
     const member = this.findMemberByAgentId(input.agentId);
     if (member === undefined) return;
-    member.ticks += 1;
+    const result = this.progressEstimator.recordToolCall({
+      memberKey: member.id,
+      toolCallId: input.toolCallId,
+      nowMs: Date.now(),
+    });
+    if (!result.accepted) return;
+    member.ticks = result.rawTicks;
     if (member.phase === 'pending' || member.phase === 'queued') {
       member.phase = 'running';
     }
+    this.startAnimationIfNeeded();
   }
 
   appendModelDelta(input: {
@@ -171,6 +181,8 @@ export class AgentSwarmProgressComponent implements Component {
       -MAX_LATEST_MODEL_CHARS,
     );
     if (member.phase === 'pending' || member.phase === 'queued') {
+      this.progressEstimator.markStarted(member.id, Date.now());
+      member.ticks = Math.max(member.ticks, 1);
       member.phase = 'running';
     }
   }
@@ -182,33 +194,51 @@ export class AgentSwarmProgressComponent implements Component {
     this.appendModelDelta(input);
   }
 
-  markCompleted(agentId: string): void {
+  markCompleted(agentId: string, completedText?: string): void {
     const member = this.findMemberByAgentId(agentId);
     if (member === undefined || member.phase === 'failed' || member.phase === 'cancelled') return;
-    if (member.phase !== 'completed') member.completedAtMs = Date.now();
+    const nowMs = Date.now();
+    if (member.phase !== 'completed') {
+      this.progressEstimator.markCompleted(member.id, nowMs);
+      member.completedAtMs = nowMs;
+    }
+    const normalizedCompletedText = normalizeFinalOutputText(completedText);
+    if (normalizedCompletedText !== undefined) member.completedText = normalizedCompletedText;
     delete member.failedAtMs;
+    delete member.failureText;
     member.phase = 'completed';
     this.startAnimationIfNeeded();
   }
 
-  markFailed(agentId: string): void {
+  markFailed(agentId: string, failureText?: string): void {
     const member = this.findMemberByAgentId(agentId);
     if (member === undefined) return;
-    if (member.phase !== 'failed') member.failedAtMs = Date.now();
+    const nowMs = Date.now();
+    if (member.phase !== 'failed') {
+      this.progressEstimator.markFailed(member.id, nowMs);
+      member.failedAtMs = nowMs;
+    }
+    const normalizedFailureText = normalizeFailureText(failureText);
+    if (normalizedFailureText !== undefined) member.failureText = normalizedFailureText;
     member.phase = 'failed';
     delete member.completedAtMs;
+    delete member.completedText;
     this.startAnimationIfNeeded();
   }
 
   markCancelled(agentId: string): void {
     const member = this.findMemberByAgentId(agentId);
     if (member === undefined) return;
+    this.progressEstimator.markCancelled(member.id, Date.now());
     member.phase = 'cancelled';
     delete member.completedAtMs;
+    delete member.completedText;
     delete member.failedAtMs;
+    delete member.failureText;
   }
 
   markActiveCancelled(): void {
+    const nowMs = Date.now();
     for (const member of this.members) {
       if (
         member.phase === 'completed' ||
@@ -217,26 +247,42 @@ export class AgentSwarmProgressComponent implements Component {
       ) {
         continue;
       }
+      this.progressEstimator.markCancelled(member.id, nowMs);
       member.phase = 'cancelled';
       delete member.completedAtMs;
+      delete member.completedText;
       delete member.failedAtMs;
+      delete member.failureText;
     }
     this.startAnimationIfNeeded();
   }
 
   applyResult(output: string): void {
+    const nowMs = Date.now();
     for (const entry of parseAgentSwarmResultStatuses(output)) {
       this.ensureMemberCount(entry.index);
       const member = this.members[entry.index - 1];
       if (member === undefined) continue;
       if (entry.status === 'completed' && member.phase !== 'completed') {
-        member.completedAtMs = Date.now();
+        this.progressEstimator.markCompleted(member.id, nowMs);
+        member.completedAtMs = nowMs;
+      }
+      if (entry.status === 'completed') {
+        const normalizedCompletedText = normalizeFinalOutputText(entry.completedText);
+        if (normalizedCompletedText !== undefined) member.completedText = normalizedCompletedText;
       }
       if (entry.status === 'completed') delete member.failedAtMs;
+      if (entry.status === 'completed') delete member.failureText;
       if (entry.status === 'failed' && member.phase !== 'failed') {
-        member.failedAtMs = Date.now();
+        this.progressEstimator.markFailed(member.id, nowMs);
+        member.failedAtMs = nowMs;
+      }
+      if (entry.status === 'failed') {
+        const normalizedFailureText = normalizeFailureText(entry.failureText);
+        if (normalizedFailureText !== undefined) member.failureText = normalizedFailureText;
       }
       if (entry.status === 'failed') delete member.completedAtMs;
+      if (entry.status === 'failed') delete member.completedText;
       member.phase = entry.status;
     }
     this.startAnimationIfNeeded();
@@ -256,21 +302,23 @@ export class AgentSwarmProgressComponent implements Component {
       return lines.map((line) => truncateToWidth(line, innerWidth));
     }
 
+    const nowMs = Date.now();
     const snapshots = this.members.map((member): AgentSwarmSnapshot => ({
       phase: member.phase,
       ticks: member.ticks,
       latestModelText: member.latestModelText,
-      phaseElapsedMs: terminalPhaseElapsedMs(member),
+      phaseElapsedMs: terminalPhaseElapsedMs(member, nowMs),
     }));
     const summary = summarizeSnapshots(snapshots);
     const lines = [
       this.renderHeader(innerWidth, summary),
       chalk.hex(this.colors.primary)('─'.repeat(innerWidth)),
       '',
-      ...this.renderGrid(innerWidth, snapshots),
+      ...this.renderGrid(innerWidth, snapshots, nowMs),
       '',
       chalk.hex(this.colors.primary)('─'.repeat(innerWidth)),
     ];
+    this.startAnimationIfNeeded();
     return lines.map((line) => truncateToWidth(line, innerWidth));
   }
 
@@ -284,7 +332,11 @@ export class AgentSwarmProgressComponent implements Component {
     return truncateToWidth(title + description, width);
   }
 
-  private renderGrid(width: number, snapshots: readonly AgentSwarmSnapshot[]): string[] {
+  private renderGrid(
+    width: number,
+    snapshots: readonly AgentSwarmSnapshot[],
+    nowMs: number,
+  ): string[] {
     const columns = columnsForWidth(width, this.members.length);
     const gapWidth = visibleWidth(CELL_GAP);
     const cellWidth = Math.max(
@@ -301,16 +353,24 @@ export class AgentSwarmProgressComponent implements Component {
         const member = this.members[index];
         const snapshot = snapshots[index];
         if (member === undefined || snapshot === undefined) continue;
-        cells.push(padAnsi(this.renderCell(member, snapshot, cellWidth), cellWidth));
+        cells.push(padAnsi(this.renderCell(member, snapshot, cellWidth, nowMs), cellWidth));
       }
       lines.push(cells.join(CELL_GAP));
     }
     return lines;
   }
 
-  private renderCell(member: AgentSwarmMember, snapshot: AgentSwarmSnapshot, width: number): string {
+  private renderCell(
+    member: AgentSwarmMember,
+    snapshot: AgentSwarmSnapshot,
+    width: number,
+    nowMs: number,
+  ): string {
     if (snapshot.phase === 'pending') {
       return renderPendingCell(member, width, this.colors);
+    }
+    if (snapshot.phase === 'queued' && snapshot.ticks <= 0) {
+      return renderQueuedCell(member, width, this.colors);
     }
 
     const fixedWidth = member.id.length + 1 + 2 + 1 + MIN_LABEL_WIDTH;
@@ -319,9 +379,15 @@ export class AgentSwarmProgressComponent implements Component {
       availableForBar >= BRAILLE_BAR_MIN_WIDTH
         ? Math.min(BRAILLE_BAR_MAX_WIDTH, availableForBar)
         : Math.max(1, availableForBar);
+    const estimate = this.progressEstimator.estimate({
+      memberKey: member.id,
+      phase: snapshot.phase,
+      capacityTicks: barWidth * BRAILLE_LEVELS.length,
+      nowMs,
+    });
     const id = chalk.hex(this.colors.textDim)(member.id);
     const bar = brailleBar(
-      snapshot.ticks,
+      estimate.displayTicks,
       snapshot.phase,
       barWidth,
       this.colors,
@@ -360,10 +426,16 @@ export class AgentSwarmProgressComponent implements Component {
 
   private ensureMemberCount(count: number): void {
     if (count <= this.members.length) return;
+    const previousLength = this.members.length;
     this.members = [
       ...this.members,
       ...createMembers(count, this.inputComplete ? 'queued' : 'pending').slice(this.members.length),
     ];
+    const nowMs = Date.now();
+    for (let index = previousLength; index < this.members.length; index += 1) {
+      const member = this.members[index];
+      if (member !== undefined) this.progressEstimator.ensureMember(member.id, nowMs);
+    }
   }
 
   private updateItemTexts(fullItems: readonly string[], partialItems: readonly string[]): void {
@@ -391,17 +463,21 @@ export class AgentSwarmProgressComponent implements Component {
 
   private hasAnimatedMembers(): boolean {
     const now = Date.now();
-    return this.members.some((member) => {
-      return (
-        member.phase === 'completed' &&
-        member.completedAtMs !== undefined &&
-        now - member.completedAtMs < COMPLETE_FILL_MS
-      ) || (
-        member.phase === 'failed' &&
-        member.failedAtMs !== undefined &&
-        now - member.failedAtMs < COMPLETE_FILL_MS
-      );
-    });
+    return (
+      this.progressEstimator.hasPendingCatchup() ||
+      this.members.some((member) =>
+        (
+          member.phase === 'completed' &&
+          member.completedAtMs !== undefined &&
+          now - member.completedAtMs < COMPLETE_FILL_MS
+        ) ||
+        (
+          member.phase === 'failed' &&
+          member.failedAtMs !== undefined &&
+          now - member.failedAtMs < COMPLETE_FILL_MS
+        ),
+      )
+    );
   }
 }
 
@@ -415,13 +491,13 @@ function createMembers(count: number, phase: AgentSwarmPhase): AgentSwarmMember[
   }));
 }
 
-function terminalPhaseElapsedMs(member: AgentSwarmMember): number {
+function terminalPhaseElapsedMs(member: AgentSwarmMember, nowMs: number): number {
   const startedAtMs = member.phase === 'completed'
     ? member.completedAtMs
     : member.phase === 'failed'
       ? member.failedAtMs
       : undefined;
-  return startedAtMs === undefined ? 0 : Math.max(0, Date.now() - startedAtMs);
+  return startedAtMs === undefined ? 0 : Math.max(0, nowMs - startedAtMs);
 }
 
 export function agentSwarmItemsFromArgs(args: Record<string, unknown>): string[] {
@@ -477,9 +553,24 @@ function parseAgentSwarmResultStatuses(output: string): AgentSwarmResultStatus[]
     result.push({
       index: Number(indexMatch[1]),
       status: statusMatch[1] as 'completed' | 'failed',
+      completedText: parseAgentSwarmCompletedText(block),
+      failureText: parseAgentSwarmFailureText(block),
     });
   }
   return result;
+}
+
+function parseAgentSwarmCompletedText(block: string): string | undefined {
+  const marker = '\n[summary]\n';
+  const markerIndex = block.indexOf(marker);
+  if (markerIndex < 0) return undefined;
+  return normalizeFinalOutputText(block.slice(markerIndex + marker.length));
+}
+
+function parseAgentSwarmFailureText(block: string): string | undefined {
+  const match = /^subagent error:\s*([\s\S]*)$/m.exec(block);
+  if (match === null) return undefined;
+  return normalizeFailureText(match[1]);
 }
 
 function columnsForWidth(width: number, count: number): number {
@@ -571,7 +662,23 @@ function renderCellLabel(
     const text = latestLine.length > 0 ? latestLine : itemText;
     if (text.length > 0) return truncateWithColor(text, width, colors.textDim);
   }
+  if (snapshot.phase === 'failed' && member.failureText !== undefined) {
+    return truncateWithColor(`Failed: ${member.failureText}`, width, colors.error);
+  }
+  if (snapshot.phase === 'completed') {
+    return renderCompletedCellLabel(member.completedText ?? latestLine, width, colors);
+  }
   return truncateWithColor(PHASE_LABELS[snapshot.phase], width, phaseColor(snapshot.phase, colors));
+}
+
+function renderCompletedCellLabel(
+  text: string,
+  width: number,
+  colors: ColorPalette,
+): string {
+  const finalText = normalizeFinalOutputText(text);
+  const label = finalText === undefined ? SUCCESS_MARK.trimEnd() : `${SUCCESS_MARK}${finalText}`;
+  return truncateWithColor(label, width, colors.success);
 }
 
 function renderPendingCell(
@@ -587,6 +694,17 @@ function renderPendingCell(
   return prefix + truncateWithColor(label, labelWidth, colors.textDim);
 }
 
+function renderQueuedCell(
+  member: AgentSwarmMember,
+  width: number,
+  colors: ColorPalette,
+): string {
+  const id = chalk.hex(colors.textDim)(member.id);
+  const prefix = `${id} `;
+  const labelWidth = Math.max(1, width - visibleWidth(prefix));
+  return prefix + truncateWithColor(QUEUED_LABEL, labelWidth, colors.textDim);
+}
+
 function truncateWithColor(text: string, width: number, color: string): string {
   const colorize = chalk.hex(color);
   return truncateToWidth(colorize(text), width, colorize('…'));
@@ -594,6 +712,18 @@ function truncateWithColor(text: string, width: number, color: string): string {
 
 function collapseWhitespace(text: string): string {
   return text.replaceAll(/\s+/g, ' ').trim();
+}
+
+function normalizeFailureText(text: string | undefined): string | undefined {
+  if (text === undefined) return undefined;
+  const normalized = collapseWhitespace(text);
+  return normalized.length > 0 ? normalized : undefined;
+}
+
+function normalizeFinalOutputText(text: string | undefined): string | undefined {
+  if (text === undefined) return undefined;
+  const normalized = collapseWhitespace(text);
+  return normalized.length > 0 ? normalized : undefined;
 }
 
 function latestNonEmptyLine(text: string): string {
@@ -718,7 +848,7 @@ function accumulatedBrailleBar(
 ): string {
   const dotsPerCell = BRAILLE_LEVELS.length;
   const cycleSize = width * dotsPerCell;
-  const safeTicks = Math.max(0, ticks);
+  const safeTicks = Math.max(0, Math.ceil(ticks));
   const completedCycles = Math.floor(safeTicks / cycleSize);
   const cycleTicks = safeTicks % cycleSize;
   const activeCells = cycleTicks === 0 ? 0 : Math.ceil(cycleTicks / dotsPerCell);

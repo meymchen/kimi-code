@@ -6,6 +6,8 @@ import { abortable, createDeadlineAbortSignal } from '../utils/abort';
 
 const SUBAGENT_LAUNCH_BATCH_SIZE = 10;
 const SUBAGENT_QUEUE_LAUNCH_DELAY_MS = 500;
+const RATE_LIMIT_SLOT_REDUCTION_WINDOW_MS = 1000;
+const RATE_LIMIT_SLOT_REDUCTION_MAX_PER_WINDOW = 3;
 
 export type QueuedSubagentTask<T = unknown> = {
   readonly data: T;
@@ -33,10 +35,22 @@ export type QueuedSubagentRunResult<T = unknown> = {
   readonly error?: string;
 };
 
-export type QueuedSubagentAttemptOutcome<T> = 'rate_limited' | QueuedSubagentRunResult<T>;
+export type QueuedSubagentRateLimitOutcome = {
+  readonly type: 'rate_limited';
+  readonly agentId?: string;
+};
+
+export type QueuedSubagentAttemptOutcome<T> =
+  | QueuedSubagentRateLimitOutcome
+  | QueuedSubagentRunResult<T>;
+
+type QueuedSubagentPending = {
+  readonly index: number;
+  readonly agentId?: string;
+};
 
 type QueuedSubagentAttempt<T> = {
-  readonly index: number;
+  readonly pending: QueuedSubagentPending;
   readonly outcome: Promise<QueuedSubagentAttemptOutcome<T>>;
   readonly readiness: Promise<void>;
   readonly ready: boolean;
@@ -46,6 +60,7 @@ type QueuedSubagentAttempt<T> = {
 export type QueuedSubagentAttemptOptions = QueuedSubagentRunOptions & {
   readonly totalTimedOut: () => boolean;
   readonly markReady: () => void;
+  readonly retryAgentId?: string;
 };
 
 type RunQueuedSubagentAttempt = <T>(
@@ -71,43 +86,78 @@ export class SubagentLaunchQueue {
     };
     const totalTimedOut = (): boolean => totalDeadline?.timedOut() === true;
 
-    const queued = tasks.map((_, index) => index);
+    const queued = tasks.map((_, index): QueuedSubagentPending => ({ index }));
     const active: Array<QueuedSubagentAttempt<T>> = [];
     const results: Array<QueuedSubagentRunResult<T> | undefined> = Array.from({
       length: tasks.length,
     });
-    let launchedAttempts = 0;
     let slotLimit: number | undefined;
+    let rateLimitReductionWindowStartMs: number | undefined;
+    let rateLimitReductionsInWindow = 0;
     const hasResults = (): boolean => results.some((result) => result !== undefined);
+    const hasRetriableQueued = (): boolean =>
+      queued.some((pending) => pending.agentId !== undefined);
 
     const finish = (fallback: string): Array<QueuedSubagentRunResult<T>> =>
       results.map(
         (result, index) => result ?? { task: tasks[index]!, status: 'failed', error: fallback },
       );
 
-    const enqueue = (index: number): void => {
-      if (results[index] !== undefined) return;
-      queued.push(index);
-      queued.sort((a, b) => a - b);
+    const requeueRateLimited = (pending: QueuedSubagentPending): void => {
+      if (results[pending.index] !== undefined) return;
+      queued.unshift(pending);
     };
 
     const failQueued = (error: string): void => {
-      for (const index of queued.splice(0)) {
+      for (const { index } of queued.splice(0)) {
         results[index] = { task: tasks[index]!, status: 'failed', error };
       }
     };
 
-    const launch = (index: number): QueuedSubagentAttempt<T> => {
+    const unreadyActiveCount = (): number =>
+      active.reduce((count, attempt) => count + (attempt.ready ? 0 : 1), 0);
+
+    const reduceSlotsAfterRateLimit = (): void => {
+      const now = Date.now();
+      if (
+        rateLimitReductionWindowStartMs === undefined ||
+        now - rateLimitReductionWindowStartMs >= RATE_LIMIT_SLOT_REDUCTION_WINDOW_MS
+      ) {
+        rateLimitReductionWindowStartMs = now;
+        rateLimitReductionsInWindow = 0;
+      }
+
+      const currentLimit = slotLimit ?? SUBAGENT_LAUNCH_BATCH_SIZE;
+      if (
+        currentLimit <= 1 ||
+        rateLimitReductionsInWindow >= RATE_LIMIT_SLOT_REDUCTION_MAX_PER_WINDOW
+      ) {
+        slotLimit = currentLimit;
+        return;
+      }
+
+      slotLimit = currentLimit - 1;
+      rateLimitReductionsInWindow += 1;
+    };
+
+    const launch = (pending: QueuedSubagentPending): QueuedSubagentAttempt<T> => {
       const readiness = createControlledPromise<void>();
       let ready = false;
       const markReady = (): void => {
         if (ready) return;
         ready = true;
+        clearTimeout(readinessTimer);
         readiness.resolve();
       };
-      const outcome = this.runAttempt(tasks[index]!, { ...options, totalTimedOut, markReady });
+      const readinessTimer = setTimeout(markReady, SUBAGENT_QUEUE_LAUNCH_DELAY_MS);
+      const outcome = this.runAttempt(tasks[pending.index]!, {
+        ...options,
+        totalTimedOut,
+        markReady,
+        retryAgentId: pending.agentId,
+      });
       const attempt: QueuedSubagentAttempt<T> = {
-        index,
+        pending,
         outcome,
         readiness,
         get ready() {
@@ -115,7 +165,6 @@ export class SubagentLaunchQueue {
         },
         settled: false,
       };
-      launchedAttempts += 1;
       void outcome.then(
         () => {
           attempt.settled = true;
@@ -133,12 +182,15 @@ export class SubagentLaunchQueue {
     const processAttempt = async (attempt: QueuedSubagentAttempt<T>): Promise<boolean> => {
       active.splice(active.indexOf(attempt), 1);
       const outcome = await attempt.outcome;
-      if (outcome === 'rate_limited') {
-        slotLimit ??= Math.max(0, launchedAttempts - 2);
-        enqueue(attempt.index);
+      if (isRateLimitedOutcome(outcome)) {
+        reduceSlotsAfterRateLimit();
+        requeueRateLimited({
+          index: attempt.pending.index,
+          agentId: outcome.agentId ?? attempt.pending.agentId,
+        });
         return false;
       }
-      results[attempt.index] = outcome;
+      results[attempt.pending.index] = outcome;
       return true;
     };
 
@@ -152,6 +204,12 @@ export class SubagentLaunchQueue {
 
     const nextSettled = (): Promise<void> =>
       Promise.race(active.map((attempt) => attempt.outcome.then(() => undefined)));
+
+    const nextReadiness = (): Promise<void> => {
+      const unready = active.filter((attempt) => !attempt.ready);
+      if (unready.length === 0) return Promise.resolve();
+      return Promise.race(unready.map((attempt) => attempt.readiness));
+    };
 
     const nextSettledAttempt = async (): Promise<QueuedSubagentAttempt<T>> => {
       await nextSettled();
@@ -170,12 +228,27 @@ export class SubagentLaunchQueue {
       return processSettledAttempts();
     };
 
-    const launchQueuedUpToSlotLimit = async (): Promise<void> => {
-      if (slotLimit === undefined || (active.length === 0 && !hasResults())) return;
-      while (queued.length > 0 && active.length < slotLimit) {
-        await abortable(sleep(SUBAGENT_QUEUE_LAUNCH_DELAY_MS), options.signal);
-        if (active.length < slotLimit) launch(queued.shift()!);
+    const launchQueuedUpToSlotLimit = async (): Promise<number> => {
+      if (slotLimit === undefined || (!hasResults() && !hasRetriableQueued())) return 0;
+      let launched = 0;
+      while (queued.length > 0 && unreadyActiveCount() < slotLimit) {
+        const delay = sleep(SUBAGENT_QUEUE_LAUNCH_DELAY_MS).then(() => 'delay' as const);
+        const settled =
+          active.length === 0
+            ? undefined
+            : nextSettled().then(() => 'settled' as const);
+        const waitResult = await abortable(
+          settled === undefined ? delay : Promise.race([delay, settled]),
+          options.signal,
+        );
+        if (waitResult === 'settled') break;
+        if (active.some((attempt) => attempt.settled)) break;
+        if (unreadyActiveCount() < slotLimit) {
+          launch(queued.shift()!);
+          launched += 1;
+        }
       }
+      return launched;
     };
 
     const launchRampBatch = (): Array<QueuedSubagentAttempt<T>> =>
@@ -189,26 +262,43 @@ export class SubagentLaunchQueue {
         if (!(await waitForRampBatch(batch))) break;
       }
 
-      if (active.length > 0 || hasResults()) await launchQueuedUpToSlotLimit();
-
       while (active.length > 0 || queued.length > 0) {
         options.signal.throwIfAborted();
         if (active.length === 0) {
           if (queued.length === 0) break;
-          if (!hasResults()) {
+          if (!hasResults() && !hasRetriableQueued()) {
             throw new Error(
               'Could not start any subagents because every launch attempt was rate limited.',
             );
           }
+          await launchQueuedUpToSlotLimit();
+          if (active.length > 0) continue;
           failQueued('No running subagents remained to open queue slots after rate-limited launches.');
           break;
         }
 
         const settled = active.find((attempt) => attempt.settled);
-        const attempt =
-          settled ?? (await abortable(nextSettledAttempt(), options.signal));
+        if (settled !== undefined) {
+          await processAttempt(settled);
+          await launchQueuedUpToSlotLimit();
+          continue;
+        }
+
+        const launched = await launchQueuedUpToSlotLimit();
+        if (launched > 0) continue;
+
+        if (
+          queued.length > 0 &&
+          slotLimit !== undefined &&
+          unreadyActiveCount() >= slotLimit &&
+          active.some((attempt) => !attempt.ready)
+        ) {
+          await abortable(Promise.race([nextSettled(), nextReadiness()]), options.signal);
+          continue;
+        }
+
+        const attempt = await abortable(nextSettledAttempt(), options.signal);
         await processAttempt(attempt);
-        await launchQueuedUpToSlotLimit();
       }
 
       return finish('Subagent stopped before it could finish.');
@@ -225,6 +315,12 @@ export function totalTimeoutMessage(timeoutMs: number | undefined): string {
   return timeoutMs === undefined
     ? 'Subagent batch total timeout elapsed.'
     : `Subagent batch total timeout after ${formatTimeoutMs(timeoutMs)}.`;
+}
+
+function isRateLimitedOutcome<T>(
+  outcome: QueuedSubagentAttemptOutcome<T>,
+): outcome is QueuedSubagentRateLimitOutcome {
+  return 'type' in outcome && outcome.type === 'rate_limited';
 }
 
 export function formatTimeoutMs(timeoutMs: number): string {

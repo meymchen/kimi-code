@@ -2309,9 +2309,26 @@ command = "vim"
     activity = stripSgr(renderActivity(driver));
     expect(activity).toContain('Agent swarm: Review changed files');
     expect(activity).toContain('001 [');
-    expect(activity).toContain('Completed');
-    expect(activity).toContain('002 [');
-    expect(activity).toContain('Queued');
+    expect(activity).toContain('✓ Reviewing src/a.ts');
+    expect(activity).not.toContain('Completed');
+    expect(activity).toContain('002 Queued...');
+    expect(activity).not.toContain('002 [');
+
+    driver.sessionEventHandler.handleEvent(
+      {
+        type: 'subagent.completed',
+        agentId: 'main',
+        sessionId: 'ses-1',
+        subagentId: 'agent-1',
+        parentToolCallId: 'call_swarm',
+        resultSummary: 'Imports are stable',
+      } as Event,
+      sendQueued,
+    );
+
+    activity = stripSgr(renderActivity(driver));
+    expect(activity).toContain('✓ Imports are stable');
+    expect(activity).not.toContain('Completed');
 
     const transcript = stripSgr(renderTranscript(driver));
     expect(transcript).toContain('Using AgentSwarm');
@@ -2372,8 +2389,8 @@ command = "vim"
     );
 
     activity = stripSgr(renderActivity(driver));
-    expect(activity).toContain('001 [');
-    expect(activity).toContain('Queued');
+    expect(activity).toContain('001 Queued...');
+    expect(activity).not.toContain('001 [');
     expect(activity).toContain('002 src/b');
 
     driver.sessionEventHandler.handleEvent(
@@ -2394,9 +2411,10 @@ command = "vim"
     );
 
     activity = stripSgr(renderActivity(driver));
-    expect(activity).toContain('001 [');
-    expect(activity).toContain('002 [');
-    expect(activity).toContain('Queued');
+    expect(activity).toContain('001 Queued...');
+    expect(activity).toContain('002 Queued...');
+    expect(activity).not.toContain('001 [');
+    expect(activity).not.toContain('002 [');
   });
 
   it('shows plan review reject on the plan card without an approval notice', async () => {

@@ -78,6 +78,7 @@ type RunSubagentOptions = {
   readonly origin?: PromptOrigin;
   readonly signal: AbortSignal;
   readonly onFirstOutput?: () => void;
+  readonly suppressRateLimitFailureEvent?: boolean;
 };
 
 type SpawnSubagentOptions = RunSubagentOptions & {
@@ -211,6 +212,49 @@ export class SessionSubagentHost {
     };
   }
 
+  async retry(agentId: string, options: RunSubagentOptions): Promise<SubagentHandle> {
+    options.signal.throwIfAborted();
+
+    const parent = await this.session.ensureAgentResumed(this.ownerAgentId);
+    const metadata = this.session.metadata.agents[agentId];
+    if (metadata?.type !== 'sub') {
+      throw new Error(`Agent instance "${agentId}" is not a subagent`);
+    }
+    if (metadata.parentAgentId !== this.ownerAgentId) {
+      throw new Error(`Agent instance "${agentId}" does not belong to this parent agent`);
+    }
+    const child = await this.session.ensureAgentResumed(agentId);
+    if (this.activeChildren.has(agentId) || child.turn.hasActiveTurn) {
+      throw new Error(
+        `Agent instance "${agentId}" is already running and cannot be retried concurrently`,
+      );
+    }
+
+    const profileName = child.config.profileName ?? 'subagent';
+
+    const controller = new AbortController();
+    const unlinkAbortSignal = linkAbortSignal(options.signal, controller);
+    this.activeChildren.set(agentId, {
+      controller,
+      runInBackground: options.runInBackground,
+    });
+
+    const completion = this.runChildRetry(parent, agentId, child, profileName, {
+      ...options,
+      signal: controller.signal,
+    }).finally(() => {
+      unlinkAbortSignal();
+      this.activeChildren.delete(agentId);
+    });
+
+    return {
+      agentId,
+      profileName,
+      resumed: true,
+      completion,
+    };
+  }
+
   async runQueued<T>(
     tasks: readonly QueuedSubagentTask<T>[],
     options: QueuedSubagentRunOptions,
@@ -276,11 +320,20 @@ export class SessionSubagentHost {
     let handle: SubagentHandle | undefined;
     try {
       runSignal.throwIfAborted();
-      handle = await this.spawn({
-        ...task,
-        signal: runSignal,
-        onFirstOutput: options.markReady,
-      });
+      handle =
+        options.retryAgentId === undefined
+          ? await this.spawn({
+              ...task,
+              signal: runSignal,
+              onFirstOutput: options.markReady,
+              suppressRateLimitFailureEvent: true,
+            })
+          : await this.retry(options.retryAgentId, {
+              ...task,
+              signal: runSignal,
+              onFirstOutput: options.markReady,
+              suppressRateLimitFailureEvent: true,
+            });
       const completion = await handle.completion;
       return {
         task,
@@ -291,7 +344,7 @@ export class SessionSubagentHost {
       };
     } catch (error) {
       if (isRateLimit429Error(error)) {
-        return 'rate_limited';
+        return { type: 'rate_limited', agentId: handle?.agentId };
       }
       if (handle === undefined) {
         throw error;
@@ -357,44 +410,91 @@ export class SessionSubagentHost {
       const origin: PromptOrigin = options.origin ?? { kind: 'system_trigger', name: 'subagent' };
       this.emitSubagentStarted(parent, childId, profileName, options);
       child.turn.prompt([{ type: 'text', text: childPrompt }], origin);
-      await runChildTurnToCompletion(child, options.signal);
-
-      // A subagent that returns an overly terse summary leaves the parent
-      // agent under-informed. Give it a bounded number of chances to expand
-      // the handoff; if it is still short after that, accept it as-is rather
-      // than retrying indefinitely.
-      let result = lastAssistantText(child);
-      let remainingContinuations = SUMMARY_CONTINUATION_ATTEMPTS;
-      while (remainingContinuations > 0 && result.length < SUMMARY_MIN_LENGTH) {
-        remainingContinuations -= 1;
-        options.signal.throwIfAborted();
-        child.turn.prompt([{ type: 'text', text: SUMMARY_CONTINUATION_PROMPT }], origin);
-        await runChildTurnToCompletion(child, options.signal);
-        result = lastAssistantText(child);
-      }
-      const usage = child.usage.data().total;
-      parent.emitEvent({
-        type: 'subagent.completed',
-        subagentId: childId,
-        parentToolCallId: options.parentToolCallId,
-        resultSummary: result,
-        usage,
-        contextTokens: child.context.tokenCount,
-      });
-      this.triggerSubagentStop(parent, profileName, result);
-      return { result, usage };
+      return await this.waitForChildCompletion(parent, childId, child, profileName, options, origin);
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      parent.emitEvent({
-        type: 'subagent.failed',
-        subagentId: childId,
-        parentToolCallId: options.parentToolCallId,
-        error: message,
-      });
+      if (!(options.suppressRateLimitFailureEvent === true && isRateLimit429Error(error))) {
+        const message = error instanceof Error ? error.message : String(error);
+        parent.emitEvent({
+          type: 'subagent.failed',
+          subagentId: childId,
+          parentToolCallId: options.parentToolCallId,
+          error: message,
+        });
+      }
       throw error;
     } finally {
       unwatchFirstOutput?.();
     }
+  }
+
+  private async runChildRetry(
+    parent: Agent,
+    childId: string,
+    child: Agent,
+    profileName: string,
+    options: RunSubagentOptions,
+  ): Promise<SubagentCompletion> {
+    const unwatchFirstOutput = this.watchFirstOutput(child, options.onFirstOutput);
+
+    try {
+      options.signal.throwIfAborted();
+      child.config.update({ modelAlias: parent.config.modelAlias });
+      const origin: PromptOrigin = options.origin ?? { kind: 'system_trigger', name: 'subagent' };
+      this.emitSubagentStarted(parent, childId, profileName, options);
+      if (child.turn.retry(origin) === null) {
+        throw new Error(`Agent instance "${childId}" could not start a retry turn`);
+      }
+      return await this.waitForChildCompletion(parent, childId, child, profileName, options, origin);
+    } catch (error) {
+      if (!(options.suppressRateLimitFailureEvent === true && isRateLimit429Error(error))) {
+        const message = error instanceof Error ? error.message : String(error);
+        parent.emitEvent({
+          type: 'subagent.failed',
+          subagentId: childId,
+          parentToolCallId: options.parentToolCallId,
+          error: message,
+        });
+      }
+      throw error;
+    } finally {
+      unwatchFirstOutput?.();
+    }
+  }
+
+  private async waitForChildCompletion(
+    parent: Agent,
+    childId: string,
+    child: Agent,
+    profileName: string,
+    options: RunSubagentOptions,
+    origin: PromptOrigin,
+  ): Promise<SubagentCompletion> {
+    await runChildTurnToCompletion(child, options.signal);
+
+    // A subagent that returns an overly terse summary leaves the parent
+    // agent under-informed. Give it a bounded number of chances to expand
+    // the handoff; if it is still short after that, accept it as-is rather
+    // than retrying indefinitely.
+    let result = lastAssistantText(child);
+    let remainingContinuations = SUMMARY_CONTINUATION_ATTEMPTS;
+    while (remainingContinuations > 0 && result.length < SUMMARY_MIN_LENGTH) {
+      remainingContinuations -= 1;
+      options.signal.throwIfAborted();
+      child.turn.prompt([{ type: 'text', text: SUMMARY_CONTINUATION_PROMPT }], origin);
+      await runChildTurnToCompletion(child, options.signal);
+      result = lastAssistantText(child);
+    }
+    const usage = child.usage.data().total;
+    parent.emitEvent({
+      type: 'subagent.completed',
+      subagentId: childId,
+      parentToolCallId: options.parentToolCallId,
+      resultSummary: result,
+      usage,
+      contextTokens: child.context.tokenCount,
+    });
+    this.triggerSubagentStop(parent, profileName, result);
+    return { result, usage };
   }
 
   private async configureChild(
@@ -542,8 +642,14 @@ function isFirstOutputEvent(event: AgentEvent): boolean {
 function isRateLimit429Error(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
   if (message.includes(RATE_LIMIT_429_MESSAGE)) return true;
-  if (!message.includes(RATE_LIMIT_429_BODY)) return false;
+  if (message.includes('provider.rate_limit')) return true;
+  if (message.includes('429') && message.toLowerCase().includes('rate limit')) return true;
+  if (!message.includes(RATE_LIMIT_429_BODY)) return hasRateLimitStatus(error);
   if (message.includes('429') || message.includes('provider.rate_limit')) return true;
+  return hasRateLimitStatus(error);
+}
+
+function hasRateLimitStatus(error: unknown): boolean {
   if (typeof error !== 'object' || error === null) return false;
   const statusCode = (error as { readonly statusCode?: unknown }).statusCode;
   const status = (error as { readonly status?: unknown }).status;

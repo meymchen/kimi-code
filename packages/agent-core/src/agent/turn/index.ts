@@ -66,6 +66,7 @@ const LLM_NOT_SET_MESSAGE = 'LLM not set, send "/login" to login';
 
 /** Origin tag for the synthetic "continue" prompt that drives each goal turn. */
 const GOAL_CONTINUATION_ORIGIN: PromptOrigin = { kind: 'system_trigger', name: 'goal_continuation' };
+const TURN_RETRY_ORIGIN: PromptOrigin = { kind: 'system_trigger', name: 'turn_retry' };
 const GOAL_RATE_LIMIT_PAUSE_REASON = 'Paused after provider rate limit';
 
 /**
@@ -157,6 +158,31 @@ export class TurnFlow {
     const turnId = this.allocateTurnId();
     const controller = new AbortController();
     const promise = this.turnWorker(turnId, input, origin, controller.signal);
+    this.activeTurn = { controller, promise };
+    return turnId;
+  }
+
+  retry(origin: PromptOrigin = TURN_RETRY_ORIGIN): number | null {
+    this.agent.records.logRecord({
+      type: 'turn.prompt',
+      input: [],
+      origin,
+    });
+    if (this.activeTurn) {
+      this.agent.emitEvent({
+        type: 'error',
+        ...makeErrorPayload(
+          'turn.agent_busy',
+          `Cannot retry the latest turn while another turn (ID ${this.turnId}) is active`,
+          { details: { turnId: this.turnId } },
+        ),
+      });
+      return null;
+    }
+
+    const turnId = this.allocateTurnId();
+    const controller = new AbortController();
+    const promise = this.retryWorker(turnId, origin, controller.signal);
     this.activeTurn = { controller, promise };
     return turnId;
   }
@@ -300,6 +326,24 @@ export class TurnFlow {
     }
   }
 
+  private async retryWorker(
+    turnId: number,
+    origin: PromptOrigin,
+    signal: AbortSignal,
+  ): Promise<TurnEndResult> {
+    const ownsActiveTurn = (): boolean =>
+      this.activeTurn !== null &&
+      this.activeTurn !== 'resuming' &&
+      this.activeTurn.controller.signal === signal;
+    try {
+      return await this.runOneTurn(turnId, null, origin, signal, true);
+    } finally {
+      if (ownsActiveTurn()) {
+        this.activeTurn = null;
+      }
+    }
+  }
+
   /**
    * Drives an active goal as a sequence of ordinary turns — the autonomous
    * equivalent of the user repeatedly typing "continue". Each iteration runs one
@@ -396,7 +440,7 @@ export class TurnFlow {
    */
   private async runOneTurn(
     turnId: number,
-    input: readonly ContentPart[],
+    input: readonly ContentPart[] | null,
     origin: PromptOrigin,
     signal: AbortSignal,
     standalone: boolean,
@@ -411,7 +455,9 @@ export class TurnFlow {
     this.agent.fullCompaction.resetForTurn();
     this.agent.usage.beginTurn();
     this.agent.emitEvent({ type: 'turn.started', turnId, origin });
-    this.agent.context.appendUserMessage(input, origin);
+    if (input !== null) {
+      this.agent.context.appendUserMessage(input, origin);
+    }
 
     const startedAt = Date.now();
     let ended: TurnEndedEvent;
@@ -421,7 +467,9 @@ export class TurnFlow {
     // sits just past the turn.ended boundary that consumers watch for.
     let errorEvent: AgentEvent | undefined;
     try {
-      const promptHookEnded = await this.applyUserPromptHook(turnId, input, origin, signal);
+      const promptHookEnded = input !== null
+        ? await this.applyUserPromptHook(turnId, input, origin, signal)
+        : undefined;
       if (promptHookEnded !== undefined) {
         ended = promptHookEnded.event;
         blockedByUserPromptHook = promptHookEnded.blocked;
