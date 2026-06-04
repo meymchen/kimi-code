@@ -1050,6 +1050,11 @@ function normalizeFailureText(text: string | undefined): string | undefined {
   return normalized.length > 0 ? normalized : undefined;
 }
 
+function normalizeStatusText(text: string): string | undefined {
+  const normalized = collapseWhitespace(text);
+  return normalized.length > 0 ? normalized : undefined;
+}
+
 function normalizeFinalOutputText(text: string | undefined): string | undefined {
   if (text === undefined) return undefined;
   const normalized = collapseWhitespace(text);
