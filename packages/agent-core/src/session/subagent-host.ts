@@ -78,6 +78,7 @@ type RunSubagentOptions = {
   readonly runInBackground: boolean;
   readonly origin?: PromptOrigin;
   readonly signal: AbortSignal;
+  readonly onStarted?: () => void;
   readonly onFirstOutput?: () => void;
   readonly suppressRateLimitFailureEvent?: boolean;
 };
@@ -331,12 +332,14 @@ export class SessionSubagentHost {
           ? await this.spawn({
               ...task,
               signal: runSignal,
+              onStarted: options.markReady,
               onFirstOutput: options.markReady,
               suppressRateLimitFailureEvent: true,
             })
           : await this.retry(options.retryAgentId, {
               ...task,
               signal: runSignal,
+              onStarted: options.markReady,
               onFirstOutput: options.markReady,
               suppressRateLimitFailureEvent: true,
             });
@@ -415,10 +418,11 @@ export class SessionSubagentHost {
       }
       const origin: PromptOrigin = options.origin ?? { kind: 'system_trigger', name: 'subagent' };
       this.emitSubagentStarted(parent, childId, profileName, options);
+      options.onStarted?.();
       child.turn.prompt([{ type: 'text', text: childPrompt }], origin);
       return await this.waitForChildCompletion(parent, childId, child, profileName, options, origin);
     } catch (error) {
-      if (!(options.suppressRateLimitFailureEvent === true && isRateLimit429Error(error))) {
+      if (!shouldSuppressQueuedAttemptFailureEvent(options, error)) {
         const message = error instanceof Error ? error.message : String(error);
         parent.emitEvent({
           type: 'subagent.failed',
@@ -447,12 +451,13 @@ export class SessionSubagentHost {
       child.config.update({ modelAlias: parent.config.modelAlias });
       const origin: PromptOrigin = options.origin ?? { kind: 'system_trigger', name: 'subagent' };
       this.emitSubagentStarted(parent, childId, profileName, options);
+      options.onStarted?.();
       if (child.turn.retry(origin) === null) {
         throw new Error(`Agent instance "${childId}" could not start a retry turn`);
       }
       return await this.waitForChildCompletion(parent, childId, child, profileName, options, origin);
     } catch (error) {
-      if (!(options.suppressRateLimitFailureEvent === true && isRateLimit429Error(error))) {
+      if (!shouldSuppressQueuedAttemptFailureEvent(options, error)) {
         const message = error instanceof Error ? error.message : String(error);
         parent.emitEvent({
           type: 'subagent.failed',
@@ -660,19 +665,29 @@ function isRateLimit429Error(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
   if (hasRateLimitStatus(error)) return true;
   if (message.includes(RATE_LIMIT_429_MESSAGE)) return true;
+  if (message.includes(RATE_LIMIT_429_BODY)) return true;
   if (message.includes('provider.rate_limit')) return true;
   const normalized = message.toLowerCase();
-  if (!/\b429\b/.test(normalized)) return false;
-  if (normalized.includes('apistatuserror')) return true;
   if (normalized.includes('too many requests')) return true;
-  if (normalized.includes('rate limit')) return true;
-  if (normalized.includes('rate_limit')) return true;
-  if (normalized.includes('rate-limited')) return true;
   if (normalized.includes('max rpm')) return true;
   if (normalized.includes('max tpm')) return true;
   if (normalized.includes('requests per minute')) return true;
   if (normalized.includes('tokens per minute')) return true;
-  return message.includes(RATE_LIMIT_429_BODY);
+  if (!/\b429\b/.test(normalized)) return false;
+  if (normalized.includes('apistatuserror')) return true;
+  if (normalized.includes('rate limit')) return true;
+  if (normalized.includes('rate_limit')) return true;
+  if (normalized.includes('rate-limited')) return true;
+  return false;
+}
+
+function shouldSuppressQueuedAttemptFailureEvent(
+  options: RunSubagentOptions,
+  error: unknown,
+): boolean {
+  if (options.suppressRateLimitFailureEvent !== true) return false;
+  if (isRateLimit429Error(error)) return true;
+  return isAbortError(error) || options.signal.aborted;
 }
 
 function hasRateLimitStatus(error: unknown): boolean {

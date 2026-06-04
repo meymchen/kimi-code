@@ -21,7 +21,7 @@ import { printableChar } from './utils/printable-key';
 const DEFAULT_SWARM_COUNT = 32;
 const MAX_SWARM_COUNT = 256;
 const FRAME_INTERVAL_MS = 80;
-const MIN_CELL_WIDTH = 32;
+const MIN_CELL_WIDTH = 30;
 const CELL_GAP = '  ';
 const BRAILLE_BAR_MIN_WIDTH = 8;
 const BRAILLE_BAR_MAX_WIDTH = 24;

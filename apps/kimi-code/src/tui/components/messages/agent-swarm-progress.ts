@@ -8,8 +8,8 @@ import {
 import { FAILURE_MARK, SUCCESS_MARK } from '#/tui/constant/symbols';
 import type { ColorPalette } from '#/tui/theme/colors';
 
-const MIN_CELL_WIDTH = 32;
-const CELL_GAP = '    ';
+const MIN_CELL_WIDTH = 30;
+const CELL_GAP = '  ';
 const FRAME_INTERVAL_MS = 80;
 const BRAILLE_BAR_MIN_WIDTH = 5;
 const BRAILLE_BAR_MAX_WIDTH = 8;
@@ -23,6 +23,7 @@ const COMPLETE_FILL_MS = 360;
 const FAILED_PLACEHOLDER_RED_FACTOR = 0.75;
 const FAILED_PLACEHOLDER_NON_RED_FACTOR = 0.25;
 const STATUS_BAR_CHAR = '━';
+const PROMPTING_TEXT_TRAILING_GAP = 1;
 const ORCHESTRATING_LABEL = 'Orchestrating...';
 const PROMPTING_LABEL = 'Prompting...';
 const WORKING_LABEL = 'Working...';
@@ -30,6 +31,14 @@ const FAILED_LABEL = 'Failed.';
 const CANCELLED_LABEL = 'Cancelled.';
 const QUEUED_LABEL = 'Queued...';
 const SUSPENDED_LABEL = 'Suspended...';
+const TOTAL_STATUS_LABEL_WIDTH = Math.max(
+  visibleWidth(ORCHESTRATING_LABEL),
+  visibleWidth(PROMPTING_LABEL),
+  visibleWidth(WORKING_LABEL),
+  visibleWidth(FAILED_LABEL),
+  visibleWidth(CANCELLED_LABEL),
+  visibleWidth(SUSPENDED_LABEL),
+);
 
 const STATUS_BAR_ORDER = [
   'completed',
@@ -270,9 +279,8 @@ export class AgentSwarmProgressComponent implements Component {
       this.findMemberForSubagent(input.agentId, input.description);
     if (member === undefined || member.phase === 'completed' || member.phase === 'cancelled') return;
     member.agentId = input.agentId;
-    member.phase = 'suspended';
-    const reason = normalizeStatusText(input.reason);
-    if (reason !== undefined) member.suspendedReason = reason;
+    member.phase = 'queued';
+    delete member.suspendedReason;
     delete member.completedAtMs;
     delete member.completedText;
     delete member.failedAtMs;
@@ -454,10 +462,12 @@ export class AgentSwarmProgressComponent implements Component {
   }
 
   private renderProgressStatusLine(width: number, status: TotalStatus): string {
-    const labelText = ` ${totalStatusLabel(status)}`;
-    const label = chalk.hex(totalStatusColor(status, this.colors))(labelText);
+    const label = renderTotalStatusLabel(
+      totalStatusLabel(status),
+      totalStatusColor(status, this.colors),
+    );
     if (this.members.length === 0) return truncateToWidth(label, width);
-    const barWidth = Math.max(0, width - visibleWidth(labelText) - 2);
+    const barWidth = Math.max(0, width - visibleWidth(label) - 2);
     if (barWidth <= 0) return truncateToWidth(label, width);
     return truncateToWidth(
       `${label} ${renderStatusPipBar(this.members, barWidth, this.colors)} `,
@@ -467,15 +477,23 @@ export class AgentSwarmProgressComponent implements Component {
 
   private renderOrchestratingStatusLine(width: number): string {
     if (this.itemsStarted) {
-      return truncateToWidth(chalk.hex(this.colors.textMuted)(` ${ORCHESTRATING_LABEL}`), width);
+      return truncateToWidth(
+        renderTotalStatusLabel(ORCHESTRATING_LABEL, this.colors.textMuted),
+        width,
+      );
     }
 
     const promptTemplate = collapseWhitespace(this.promptTemplateText);
-    const labelText = ` ${promptTemplate.length > 0 ? PROMPTING_LABEL : ORCHESTRATING_LABEL}`;
-    const label = chalk.hex(this.colors.textMuted)(labelText);
+    const label = renderTotalStatusLabel(
+      promptTemplate.length > 0 ? PROMPTING_LABEL : ORCHESTRATING_LABEL,
+      this.colors.textMuted,
+    );
     if (promptTemplate.length === 0) return truncateToWidth(label, width);
 
-    const availablePromptWidth = Math.max(0, width - visibleWidth(labelText));
+    const availablePromptWidth = Math.max(
+      0,
+      width - visibleWidth(label) - PROMPTING_TEXT_TRAILING_GAP,
+    );
     const separator = visibleWidth(promptTemplate) <= availablePromptWidth - 1 ? ' ' : '  ';
     const promptWidth = Math.max(0, availablePromptWidth - visibleWidth(separator));
     if (promptWidth <= 0) return truncateToWidth(label, width);
@@ -844,6 +862,10 @@ function renderStatusPipBar(
   }).join('');
 }
 
+function renderTotalStatusLabel(label: string, color: string): string {
+  return ` ${padAnsi(chalk.hex(color)(label), TOTAL_STATUS_LABEL_WIDTH)}`;
+}
+
 function statusBarCounts(members: readonly AgentSwarmMember[]): StatusBarCount[] {
   const counts = new Map<StatusBarPhase, number>();
   for (const member of members) {
@@ -972,9 +994,6 @@ function renderCellLabel(
   if (snapshot.phase === 'failed' && member.failureText !== undefined) {
     return truncateWithColor(`${FAILURE_MARK}${member.failureText}`, width, colors.error);
   }
-  if (snapshot.phase === 'suspended' && member.suspendedReason !== undefined) {
-    return truncateWithColor(`Suspended: ${member.suspendedReason}`, width, colors.warning);
-  }
   if (snapshot.phase === 'completed') {
     return renderCompletedCellLabel(member.completedText ?? latestLine, width, colors);
   }
@@ -1062,11 +1081,6 @@ function nestedAgentSwarmFailureText(text: string): string | undefined {
 
 function stripAgentSwarmPrefix(text: string): string {
   return text.replace(/^agent_swarm:\s*(?:failed|completed)?\s*/i, '').trim();
-}
-
-function normalizeStatusText(text: string): string | undefined {
-  const normalized = collapseWhitespace(text);
-  return normalized.length > 0 ? normalized : undefined;
 }
 
 function normalizeFinalOutputText(text: string | undefined): string | undefined {

@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { visibleWidth } from '@earendil-works/pi-tui';
 
 import {
   AgentSwarmProgressComponent,
@@ -49,6 +50,24 @@ describe('AgentSwarmProgressComponent', () => {
     expect(output).not.toContain('001 [');
     expect(output).not.toContain('002 [');
     expect(output).not.toContain('agents=2');
+  });
+
+  it('fits three queued columns with the narrower gap and minimum cell width', () => {
+    const component = new AgentSwarmProgressComponent({
+      description: 'Review changed files',
+      colors: darkColors,
+    });
+
+    component.registerSubagent({ agentId: 'agent-1', description: 'Review changed files #1 (coder)' });
+    component.registerSubagent({ agentId: 'agent-2', description: 'Review changed files #2 (coder)' });
+    component.registerSubagent({ agentId: 'agent-3', description: 'Review changed files #3 (coder)' });
+
+    const lines = strip(component.render(94).join('\n')).split('\n');
+    const queuedLine = lines.find((line) => line.includes('001 Queued...'));
+
+    expect(queuedLine).toBeDefined();
+    expect(queuedLine).toContain('002 Queued...');
+    expect(queuedLine).toContain('003 Queued...');
   });
 
   it('advances from queued when a subagent tool call starts and marks terminal states', () => {
@@ -108,7 +127,7 @@ describe('AgentSwarmProgressComponent', () => {
     expect(output).not.toContain('Failed:');
   });
 
-  it('renders suspended subagents and clears the state when they start again', () => {
+  it('renders suspended subagents as queued and clears the state when they start again', () => {
     const component = new AgentSwarmProgressComponent({
       description: 'Review changed files',
       colors: darkColors,
@@ -122,7 +141,9 @@ describe('AgentSwarmProgressComponent', () => {
     });
 
     let output = strip(component.render(100).join('\n'));
-    expect(output).toContain('Suspended: Provider rate limit; subagent requeued for retry.');
+    expect(output).toContain('Queued...');
+    expect(output).not.toContain('Suspended');
+    expect(output).not.toContain('Provider rate limit');
     expect(output).not.toContain('Failed');
 
     component.markStarted('agent-1');
@@ -279,6 +300,57 @@ describe('AgentSwarmProgressComponent', () => {
     expect(output).toContain('001 [');
     expect(output).toContain('Reviewing');
     expect(output).toContain('…');
+  });
+
+  it('keeps total status labels fixed before bars and streaming text', () => {
+    const prompting = new AgentSwarmProgressComponent({
+      description: '',
+      colors: darkColors,
+    });
+    prompting.updateArgs({}, {
+      streamingArguments: '{"prompt_template":"Review the changed TypeScript files carefully',
+    });
+
+    const promptLine = strip(prompting.render(80).join('\n'))
+      .split('\n')
+      .find((line) => line.includes('Prompting...'));
+    expect(promptLine).toBeDefined();
+
+    const working = new AgentSwarmProgressComponent({
+      description: 'Review changed files',
+      colors: darkColors,
+    });
+    working.registerSubagent({ agentId: 'agent-1', description: 'Review changed files #1 (coder)' });
+    working.markInputComplete();
+    working.markStarted('agent-1');
+
+    const workingLine = strip(working.render(80).join('\n'))
+      .split('\n')
+      .find((line) => line.includes('Working...'));
+    expect(workingLine).toBeDefined();
+
+    const promptTextIndex = promptLine?.indexOf('Review the changed') ?? -1;
+    const progressBarIndex = workingLine?.indexOf('━') ?? -1;
+    expect(promptTextIndex).toBeGreaterThan(0);
+    expect(progressBarIndex).toBeGreaterThan(0);
+    expect(promptTextIndex).toBe(progressBarIndex);
+  });
+
+  it('reserves one trailing cell for prompting streaming text', () => {
+    const prompting = new AgentSwarmProgressComponent({
+      description: '',
+      colors: darkColors,
+    });
+    prompting.updateArgs({}, {
+      streamingArguments: '{"prompt_template":"Review every changed TypeScript file and summarize regressions carefully before reporting',
+    });
+
+    const promptLine = strip(prompting.render(50).join('\n'))
+      .split('\n')
+      .find((line) => line.includes('Prompting...'));
+
+    expect(promptLine).toBeDefined();
+    expect(visibleWidth(promptLine ?? '')).toBe(49);
   });
 
   it('renders boosted fractional progress ticks without leaking undefined cells', () => {

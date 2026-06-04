@@ -903,6 +903,46 @@ command = "vim"
     ).toHaveLength(1);
   });
 
+  it('removes AgentSwarm progress from undone turns', async () => {
+    const { driver, session } = await makeDriver();
+    const sendQueued = vi.fn();
+
+    driver.handleUserInput('launch swarm');
+    driver.sessionEventHandler.handleEvent(
+      {
+        type: 'tool.call.started',
+        agentId: 'main',
+        sessionId: 'ses-1',
+        turnId: 1,
+        toolCallId: 'call_swarm',
+        name: 'AgentSwarm',
+        args: {
+          description: 'Review changed files',
+          prompt_template: 'Review {{item}}',
+          items: ['src/a.ts', 'src/b.ts'],
+        },
+      } as Event,
+      sendQueued,
+    );
+
+    let transcript = stripSgr(renderTranscript(driver));
+    expect(transcript).toContain('launch swarm');
+    expect(transcript).toContain('Agent swarm');
+    expect(transcript).toContain('Review changed files');
+
+    driver.state.appState.streamingPhase = 'idle';
+    driver.handleUserInput('/undo');
+
+    await vi.waitFor(() => {
+      expect(session.undoHistory).toHaveBeenCalledWith(1);
+    });
+
+    transcript = stripSgr(renderTranscript(driver));
+    expect(transcript).not.toContain('launch swarm');
+    expect(transcript).not.toContain('Agent swarm');
+    expect(transcript).not.toContain('Review changed files');
+  });
+
   it('removes approval notices from undone turns', async () => {
     const { driver, session } = await makeDriver();
     const approvalHandler = vi.mocked(session.setApprovalHandler).mock.calls[0]?.[0] as
@@ -2312,7 +2352,9 @@ command = "vim"
     expect(driver.state.ui.requestRender).toHaveBeenCalled();
 
     transcript = stripSgr(renderTranscript(driver));
-    expect(transcript).toContain('Suspended: Provider rate limit; subagent');
+    expect(transcript).toContain('001 [');
+    expect(transcript).toContain('Queued...');
+    expect(transcript).not.toContain('Provider rate limit');
     expect(transcript).not.toContain('Failed');
 
     vi.mocked(driver.state.ui.requestRender).mockClear();
