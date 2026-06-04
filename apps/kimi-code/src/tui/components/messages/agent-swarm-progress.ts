@@ -22,10 +22,15 @@ const MAX_LATEST_MODEL_CHARS = 2_000;
 const COMPLETE_FILL_MS = 360;
 const FAILED_PLACEHOLDER_RED_FACTOR = 0.75;
 const FAILED_PLACEHOLDER_NON_RED_FACTOR = 0.25;
+const STATUS_BAR_CHAR = '━';
 const ORCHESTRATING_LABEL = 'Orchestrating...';
+const WORKING_LABEL = 'Working...';
 const QUEUED_LABEL = 'Queued...';
 
+const STATUS_BAR_ORDER = ['completed', 'working', 'queued', 'cancelled', 'failed'] as const;
+
 type AgentSwarmPhase = AgentSwarmProgressEstimatorPhase;
+type StatusBarPhase = typeof STATUS_BAR_ORDER[number];
 
 interface AgentSwarmMember {
   readonly id: string;
@@ -83,6 +88,7 @@ export class AgentSwarmProgressComponent implements Component {
   private readonly colors: ColorPalette;
   private readonly requestRender: (() => void) | undefined;
   private inputComplete = false;
+  private promptTemplateText = '';
   private timer: ReturnType<typeof setInterval> | undefined;
 
   constructor(options: AgentSwarmProgressOptions) {
@@ -108,13 +114,23 @@ export class AgentSwarmProgressComponent implements Component {
     if (description.length > 0 || this.description.length === 0) {
       this.description = description;
     }
-    const fullItemsCount = agentSwarmItemsFromArgs(args).length;
+    const fullItems = agentSwarmItemsFromArgs(args);
     const partialItems =
       options.streamingArguments === undefined
         ? []
         : agentSwarmPartialItemsFromArguments(options.streamingArguments);
-    const fullItems = agentSwarmItemsFromArgs(args);
-    const itemCount = Math.max(fullItemsCount, partialItems.length);
+    const fullPromptTemplate = agentSwarmPromptTemplateFromArgs(args);
+    const partialPromptTemplate =
+      options.streamingArguments === undefined
+        ? ''
+        : agentSwarmPartialPromptTemplateFromArguments(options.streamingArguments);
+    const promptTemplate =
+      fullPromptTemplate.length > 0 ? fullPromptTemplate : partialPromptTemplate;
+    if (promptTemplate.length > 0 || this.promptTemplateText.length === 0) {
+      this.promptTemplateText = promptTemplate;
+    }
+
+    const itemCount = Math.max(fullItems.length, partialItems.length);
     if (itemCount > 0) this.ensureMemberCount(itemCount);
     this.updateItemTexts(fullItems, partialItems);
   }
@@ -295,7 +311,7 @@ export class AgentSwarmProgressComponent implements Component {
         this.renderHeader(innerWidth, undefined),
         chalk.hex(this.colors.primary)('─'.repeat(innerWidth)),
         '',
-        chalk.hex(this.colors.textMuted)(` ${ORCHESTRATING_LABEL}`),
+        this.renderStatusLine(innerWidth),
         '',
         chalk.hex(this.colors.primary)('─'.repeat(innerWidth)),
       ];
@@ -316,6 +332,8 @@ export class AgentSwarmProgressComponent implements Component {
       '',
       ...this.renderGrid(innerWidth, snapshots, nowMs),
       '',
+      this.renderStatusLine(innerWidth),
+      '',
       chalk.hex(this.colors.primary)('─'.repeat(innerWidth)),
     ];
     this.startAnimationIfNeeded();
@@ -330,6 +348,33 @@ export class AgentSwarmProgressComponent implements Component {
         : '';
     void summary;
     return truncateToWidth(title + description, width);
+  }
+
+  private renderStatusLine(width: number): string {
+    if (!this.inputComplete) {
+      return this.renderOrchestratingStatusLine(width);
+    }
+
+    const labelText = ` ${WORKING_LABEL}`;
+    const label = chalk.hex(this.colors.success)(labelText);
+    const barWidth = Math.max(0, width - visibleWidth(labelText) - 2);
+    if (barWidth <= 0) return truncateToWidth(label, width);
+    return truncateToWidth(
+      `${label} ${renderStatusPipBar(this.members, barWidth, this.colors)} `,
+      width,
+    );
+  }
+
+  private renderOrchestratingStatusLine(width: number): string {
+    const labelText = ` ${ORCHESTRATING_LABEL}`;
+    const label = chalk.hex(this.colors.textMuted)(labelText);
+    const promptTemplate = collapseWhitespace(this.promptTemplateText);
+    if (promptTemplate.length === 0) return truncateToWidth(label, width);
+
+    const promptWidth = Math.max(0, width - visibleWidth(labelText) - 1);
+    if (promptWidth <= 0) return truncateToWidth(label, width);
+    const prompt = truncateStartWithColor(promptTemplate, promptWidth, this.colors.textDim);
+    return truncateToWidth(`${label} ${prompt}`, width);
   }
 
   private renderGrid(
@@ -535,6 +580,17 @@ export function agentSwarmDescriptionFromArgs(args: Record<string, unknown>): st
   return typeof description === 'string' ? description : '';
 }
 
+function agentSwarmPromptTemplateFromArgs(args: Record<string, unknown>): string {
+  const promptTemplate = args['prompt_template'];
+  return typeof promptTemplate === 'string' ? promptTemplate : '';
+}
+
+function agentSwarmPartialPromptTemplateFromArguments(argumentsText: string): string {
+  const match = /"prompt_template"\s*:\s*"/.exec(argumentsText);
+  if (match === null) return '';
+  return parsePartialJsonString(argumentsText, match.index + match[0].length).value;
+}
+
 function parseAgentSwarmDescriptionIndex(description: string | undefined): number | undefined {
   if (description === undefined) return undefined;
   const match = /#(\d+)(?:\s|$|\()/.exec(description);
@@ -650,6 +706,92 @@ function phaseColor(phase: AgentSwarmPhase, colors: ColorPalette): string {
   }
 }
 
+interface StatusBarCount {
+  readonly phase: StatusBarPhase;
+  readonly count: number;
+}
+
+function renderStatusPipBar(
+  members: readonly AgentSwarmMember[],
+  width: number,
+  colors: ColorPalette,
+): string {
+  const safeWidth = Math.max(1, width);
+  const counts = statusBarCounts(members);
+  if (counts.length === 0) {
+    return chalk.hex(colors.textMuted)(STATUS_BAR_CHAR.repeat(safeWidth));
+  }
+
+  const segmentWidths = allocateSegmentWidths(counts.map((entry) => entry.count), safeWidth);
+  return counts.map((entry, index) => {
+    const segmentWidth = segmentWidths[index] ?? 0;
+    if (segmentWidth <= 0) return '';
+    return chalk.hex(statusBarColor(entry.phase, colors))(STATUS_BAR_CHAR.repeat(segmentWidth));
+  }).join('');
+}
+
+function statusBarCounts(members: readonly AgentSwarmMember[]): StatusBarCount[] {
+  const counts = new Map<StatusBarPhase, number>();
+  for (const member of members) {
+    const phase = statusBarPhase(member.phase);
+    counts.set(phase, (counts.get(phase) ?? 0) + 1);
+  }
+  return STATUS_BAR_ORDER.flatMap((phase) => {
+    const count = counts.get(phase) ?? 0;
+    return count > 0 ? [{ phase, count }] : [];
+  });
+}
+
+function statusBarPhase(phase: AgentSwarmPhase): StatusBarPhase {
+  switch (phase) {
+    case 'pending':
+    case 'queued':
+      return 'queued';
+    case 'running':
+      return 'working';
+    case 'completed':
+      return 'completed';
+    case 'failed':
+      return 'failed';
+    case 'cancelled':
+      return 'cancelled';
+  }
+}
+
+function statusBarColor(phase: StatusBarPhase, colors: ColorPalette): string {
+  switch (phase) {
+    case 'queued':
+      return colors.textMuted;
+    case 'working':
+      return colors.primary;
+    case 'completed':
+      return colors.success;
+    case 'failed':
+      return colors.error;
+    case 'cancelled':
+      return colors.warning;
+  }
+}
+
+function allocateSegmentWidths(counts: readonly number[], width: number): number[] {
+  const total = counts.reduce((sum, count) => sum + count, 0);
+  if (total <= 0 || width <= 0) return counts.map(() => 0);
+
+  const exact = counts.map((count) => count * width / total);
+  const widths = exact.map(Math.floor);
+  let remaining = width - widths.reduce((sum, value) => sum + value, 0);
+  const order = exact
+    .map((value, index) => ({ index, fraction: value - Math.floor(value) }))
+    .toSorted((a, b) => b.fraction - a.fraction || a.index - b.index);
+
+  for (const entry of order) {
+    if (remaining <= 0) break;
+    widths[entry.index] = (widths[entry.index] ?? 0) + 1;
+    remaining -= 1;
+  }
+  return widths;
+}
+
 function renderCellLabel(
   member: AgentSwarmMember,
   snapshot: AgentSwarmSnapshot,
@@ -708,6 +850,30 @@ function renderQueuedCell(
 function truncateWithColor(text: string, width: number, color: string): string {
   const colorize = chalk.hex(color);
   return truncateToWidth(colorize(text), width, colorize('…'));
+}
+
+function truncateStartWithColor(text: string, width: number, color: string): string {
+  return chalk.hex(color)(truncateStartToWidth(text, width));
+}
+
+function truncateStartToWidth(text: string, width: number): string {
+  if (visibleWidth(text) <= width) return text;
+  const ellipsis = '…';
+  const ellipsisWidth = visibleWidth(ellipsis);
+  if (width <= ellipsisWidth) return truncateToWidth(ellipsis, width);
+
+  const targetWidth = width - ellipsisWidth;
+  const segments = Array.from(text);
+  let tail = '';
+  let tailWidth = 0;
+  for (let index = segments.length - 1; index >= 0; index -= 1) {
+    const segment = segments[index] ?? '';
+    const segmentWidth = visibleWidth(segment);
+    if (tailWidth + segmentWidth > targetWidth) break;
+    tail = segment + tail;
+    tailWidth += segmentWidth;
+  }
+  return ellipsis + tail;
 }
 
 function collapseWhitespace(text: string): string {

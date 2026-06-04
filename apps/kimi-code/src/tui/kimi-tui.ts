@@ -1017,6 +1017,10 @@ export class KimiTUI {
     this.state.ui.requestRender();
   }
 
+  clearAgentSwarmProgress(): void {
+    this.sessionEventHandler.clearAgentSwarmProgress();
+  }
+
   // =========================================================================
   // Session Runtime
   // =========================================================================

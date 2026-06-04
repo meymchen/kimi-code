@@ -126,9 +126,13 @@ export class SessionEventHandler {
     this.renderedSkillActivationIds.clear();
     this.renderedMcpServerStatusKeys.clear();
     this.mcpServers.clear();
+    this.clearAgentSwarmProgress();
+    this.stopAllMcpServerStatusSpinners();
+  }
+
+  clearAgentSwarmProgress(): void {
     this.agentSwarmProgress.clear();
     this.host.setAgentSwarmProgress(null);
-    this.stopAllMcpServerStatusSpinners();
   }
 
   startSubscription(): void {
@@ -269,12 +273,6 @@ export class SessionEventHandler {
         });
       } else if (event.type === 'subagent.started') {
         swarmProgress.markStarted(event.subagentId);
-      } else if (event.type === 'turn.ended') {
-        if (event.reason === 'cancelled') {
-          swarmProgress.markCancelled(subagentId);
-        } else {
-          swarmProgress.markCompleted(subagentId);
-        }
       } else if (event.type === 'subagent.failed') {
         if (isUserCancelledSubagentError(event.error)) {
           swarmProgress.markCancelled(event.subagentId);
@@ -336,10 +334,10 @@ export class SessionEventHandler {
       case 'compaction.started':
       case 'cron.fired':
       case 'error':
+      case 'goal.updated':
       case 'warning':
       case 'session.meta.updated':
       case 'skill.activated':
-      case 'goal.updated':
       case 'subagent.completed':
       case 'subagent.failed':
       case 'subagent.spawned':
@@ -361,8 +359,7 @@ export class SessionEventHandler {
 
   private handleTurnBegin(_event: TurnStartedEvent): void {
     void _event;
-    this.agentSwarmProgress.clear();
-    this.host.setAgentSwarmProgress(null);
+    this.clearAgentSwarmProgress();
     this.host.streamingUI.resetToolUi();
     this.host.streamingUI.setStep(0);
     this.host.patchLivePane({

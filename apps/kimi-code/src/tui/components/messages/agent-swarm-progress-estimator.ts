@@ -1,10 +1,10 @@
 const DEFAULT_RATE_WINDOW_MS = 45_000;
 const DEFAULT_CATCHUP_TIME_MS = 1_500;
+const DEFAULT_WORKLOAD_SPREAD_FACTOR = 1.5;
 const DEFAULT_UNFINISHED_PROGRESS_CAP = 0.85;
 const DEFAULT_MAX_BOOST_GAIN = 0.75;
 const RATE_TOOL_CONFIDENCE_SCALE = 4;
 const BOOST_TOOL_CONFIDENCE_SCALE = 3;
-const COMPLETED_SAMPLE_CONFIDENCE_SCALE = 3;
 const MIN_RATE_FACTOR = 0.25;
 const HALF_TICK = 0.5;
 
@@ -20,6 +20,7 @@ export interface AgentSwarmProgressEstimatorOptions {
   readonly rateWindowMs?: number;
   readonly catchupTimeMs?: number;
   readonly maxCatchupTicksPerSecond?: number;
+  readonly workloadSpreadFactor?: number;
   readonly unfinishedProgressCap?: number;
   readonly maxBoostGain?: number;
 }
@@ -62,6 +63,7 @@ interface CompletedSample {
 interface EstimatePrior {
   readonly completedCount: number;
   readonly typicalTotalMs: number;
+  readonly typicalToolCalls: number;
   readonly typicalRatePerMs: number;
 }
 
@@ -70,6 +72,7 @@ export class AgentSwarmProgressEstimator {
   private readonly rateWindowMs: number;
   private readonly catchupTimeMs: number;
   private readonly maxCatchupTicksPerSecond: number | undefined;
+  private readonly workloadSpreadFactor: number;
   private readonly unfinishedProgressCap: number;
   private readonly maxBoostGain: number;
 
@@ -77,6 +80,10 @@ export class AgentSwarmProgressEstimator {
     this.rateWindowMs = positiveOrDefault(options.rateWindowMs, DEFAULT_RATE_WINDOW_MS);
     this.catchupTimeMs = positiveOrDefault(options.catchupTimeMs, DEFAULT_CATCHUP_TIME_MS);
     this.maxCatchupTicksPerSecond = positiveOrUndefined(options.maxCatchupTicksPerSecond);
+    this.workloadSpreadFactor = spreadFactorOrDefault(
+      options.workloadSpreadFactor,
+      DEFAULT_WORKLOAD_SPREAD_FACTOR,
+    );
     this.unfinishedProgressCap = clampPositiveRatio(
       options.unfinishedProgressCap,
       DEFAULT_UNFINISHED_PROGRESS_CAP,
@@ -157,7 +164,13 @@ export class AgentSwarmProgressEstimator {
       return baseEstimate;
     }
 
-    const estimatedTotalToolCalls = this.estimateTotalToolCalls(state, prior, input.nowMs);
+    const completedConfidence = this.completedSampleConfidence(prior.completedCount);
+    const estimatedTotalToolCalls = this.estimateTotalToolCalls(
+      state,
+      prior,
+      input.nowMs,
+      completedConfidence,
+    );
     const estimatedProgress = Math.min(
       this.unfinishedProgressCap,
       rawTicks / estimatedTotalToolCalls,
@@ -175,7 +188,6 @@ export class AgentSwarmProgressEstimator {
       };
     }
 
-    const completedConfidence = confidence(prior.completedCount, COMPLETED_SAMPLE_CONFIDENCE_SCALE);
     const toolConfidence = confidence(rawTicks, BOOST_TOOL_CONFIDENCE_SCALE);
     const boostConfidence = completedConfidence * toolConfidence;
     const boostGain = this.maxBoostGain * boostConfidence;
@@ -254,6 +266,7 @@ export class AgentSwarmProgressEstimator {
     return {
       completedCount: samples.length,
       typicalTotalMs: logMedian(samples.map((sample) => sample.totalMs)),
+      typicalToolCalls: logMedian(samples.map((sample) => sample.rawTicks)),
       typicalRatePerMs: logMedian(
         samples.map((sample) => (sample.rawTicks + HALF_TICK) / sample.totalMs),
       ),
@@ -277,6 +290,7 @@ export class AgentSwarmProgressEstimator {
     state: MemberProgressState,
     prior: EstimatePrior,
     nowMs: number,
+    completedConfidence: number,
   ): number {
     const elapsedMs = Math.max(0, nowMs - (state.startedAtMs ?? nowMs));
     const localRatePerMs = this.estimateLocalRatePerMs(state, elapsedMs, nowMs);
@@ -292,11 +306,28 @@ export class AgentSwarmProgressEstimator {
     );
     const totalMs = Math.max(prior.typicalTotalMs, elapsedMs / this.unfinishedProgressCap);
     const estimatedTotalToolCalls = ratePerMs * totalMs;
-    return Math.max(
+    const boundedTotalToolCalls = this.softBoundTotalToolCalls(
       estimatedTotalToolCalls,
+      prior,
+      completedConfidence,
+    );
+    return Math.max(
+      boundedTotalToolCalls,
       state.rawTicks / this.unfinishedProgressCap,
       1,
     );
+  }
+
+  private softBoundTotalToolCalls(
+    totalToolCalls: number,
+    prior: EstimatePrior,
+    completedConfidence: number,
+  ): number {
+    const lowerBound = prior.typicalToolCalls / this.workloadSpreadFactor;
+    const upperBound = prior.typicalToolCalls * this.workloadSpreadFactor;
+    const bounded = Math.max(lowerBound, Math.min(upperBound, totalToolCalls));
+    if (bounded === totalToolCalls) return totalToolCalls;
+    return geometricInterpolate(totalToolCalls, bounded, completedConfidence);
   }
 
   private estimateLocalRatePerMs(
@@ -331,6 +362,10 @@ export class AgentSwarmProgressEstimator {
     const maxDelta = Math.max(0, maxCatchupTicksPerSecond * (elapsedMs / 1_000));
     return previousDisplayTicks + Math.min(desiredDelta, maxDelta);
   }
+
+  private completedSampleConfidence(completedCount: number): number {
+    return confidence(completedCount, 1 + this.workloadSpreadFactor);
+  }
 }
 
 function positiveOrDefault(value: number | undefined, fallback: number): number {
@@ -339,6 +374,10 @@ function positiveOrDefault(value: number | undefined, fallback: number): number 
 
 function positiveOrUndefined(value: number | undefined): number | undefined {
   return value !== undefined && Number.isFinite(value) && value > 0 ? value : undefined;
+}
+
+function spreadFactorOrDefault(value: number | undefined, fallback: number): number {
+  return value !== undefined && Number.isFinite(value) && value > 1 ? value : fallback;
 }
 
 function clampPositiveRatio(value: number | undefined, fallback: number): number {
