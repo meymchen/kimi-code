@@ -1,5 +1,6 @@
 import type { KimiConfig } from '@moonshot-ai/kimi-code-sdk';
 
+import { i18n, resolveLocale } from '#/tui/i18n';
 import { currentTheme, lightColors } from '#/tui/theme';
 import { loadTuiConfig, type TuiConfig } from '../config';
 import type { SlashCommandHost } from './dispatch';
@@ -43,10 +44,15 @@ export async function applyReloadedTuiConfig(
     : undefined;
   await host.applyTheme(config.theme, resolved);
   host.refreshTerminalThemeTracking();
+  // Re-apply the language alongside the theme: update the persisted preference
+  // in app state and flip the live i18n locale so a reloaded `language` takes
+  // effect without a process restart.
+  i18n.setLocale(resolveLocale(config.language));
   host.setAppState({
     editorCommand: config.editorCommand,
     notifications: config.notifications,
     upgrade: config.upgrade,
+    language: config.language,
   });
 }
 
