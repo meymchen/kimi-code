@@ -42,6 +42,7 @@ export const commands: MessageTree = {
     login: '选择平台并进行认证',
     'export-md': '将当前会话导出为 Markdown 文件',
     'export-debug-zip': '将当前会话导出为调试 ZIP 压缩包',
+    web: '在 Web UI 中打开当前会话并退出终端',
     exit: '退出应用程序',
     version: '显示版本信息',
   },

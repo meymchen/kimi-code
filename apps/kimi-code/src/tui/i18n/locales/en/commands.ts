@@ -46,6 +46,7 @@ export const commands: MessageTree = {
     login: 'Select a platform and authenticate',
     'export-md': 'Export current session as a Markdown file',
     'export-debug-zip': 'Export current session as a debug ZIP archive',
+    web: 'Open the current session in the Web UI and exit the terminal',
     exit: 'Exit the application',
     version: 'Show version information',
   },
