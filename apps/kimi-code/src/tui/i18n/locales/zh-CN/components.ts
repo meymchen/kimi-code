@@ -7,6 +7,19 @@
 import type { MessageTree } from '../../i18n';
 
 export const components: MessageTree = {
+  welcome: {
+    title: '欢迎使用 Kimi Code！',
+    getStarted: '运行 /login 或 /provider 开始使用。',
+    helpHint: '发送 /help 获取帮助信息。',
+    modelNotSet: '未设置，运行 /login 或 /provider',
+    labels: {
+      directory: '目录',
+      session: '会话',
+      model: '模型',
+      version: '版本',
+      mcp: 'MCP',
+    },
+  },
   footer: {
     context: '上下文',
     thinking: '思考中',

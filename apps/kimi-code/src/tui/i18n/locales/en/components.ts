@@ -9,6 +9,19 @@
 import type { MessageTree } from '../../i18n';
 
 export const components: MessageTree = {
+  welcome: {
+    title: 'Welcome to Kimi Code!',
+    getStarted: 'Run /login or /provider to get started.',
+    helpHint: 'Send /help for help information.',
+    modelNotSet: 'not set, run /login or /provider',
+    labels: {
+      directory: 'Directory',
+      session: 'Session',
+      model: 'Model',
+      version: 'Version',
+      mcp: 'MCP',
+    },
+  },
   footer: {
     context: 'context',
     thinking: 'thinking',

@@ -8,11 +8,13 @@
 import type { MessageTree } from '../../i18n';
 
 import { commands } from './commands';
+import { common } from './common';
 import { components } from './components';
 import { reverseRpc } from './reverse-rpc';
 
 export const en: MessageTree = {
   commands,
+  common,
   components,
   reverseRpc,
 };
