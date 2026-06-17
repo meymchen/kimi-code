@@ -7,10 +7,12 @@
 
 import type { MessageTree } from '../../i18n';
 
+import { commands } from './commands';
 import { components } from './components';
 import { reverseRpc } from './reverse-rpc';
 
 export const zhCN: MessageTree = {
+  commands,
   components,
   reverseRpc,
 };
